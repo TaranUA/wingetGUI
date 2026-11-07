@@ -6,12 +6,14 @@ installer.
 ![Windows 10 and 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
 ![Size](https://img.shields.io/badge/download-~140%20KB-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-blue)
+[![Release](https://img.shields.io/github/v/release/TaranUA/wingetGUI)](https://github.com/TaranUA/wingetGUI/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/TaranUA/wingetGUI/release.yml)](https://github.com/TaranUA/wingetGUI/actions/workflows/release.yml)
 
 ![Winget Update Manager](docs/screenshot-main-dark.png)
 
 ## Download
 
-Grab `WingetGUI.exe` from the [latest release](../../releases/latest) and run it.
+Grab `WingetGUI.exe` from the [latest release](https://github.com/TaranUA/wingetGUI/releases/latest) and run it.
 There is nothing to install and no runtime to download.
 
 > The executable is not code-signed, so SmartScreen may show *"Windows protected
@@ -78,7 +80,7 @@ The toolchain is not committed to this repository.
 1. Clone the repository:
 
    ```powershell
-   git clone https://github.com/<owner>/wingetGUI.git
+   git clone https://github.com/TaranUA/wingetGUI.git
    cd wingetGUI
    ```
 
@@ -93,6 +95,11 @@ The toolchain is not committed to this repository.
    ```
 
 The result is `dist\WingetGUI.exe` (about 140 KB, statically linked).
+
+Releases are built by GitHub Actions: pushing a `v*` tag runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which restores
+the toolchain, runs the parser tests, builds, and attaches `WingetGUI.exe` to a
+GitHub release.
 
 > Close a running `WingetGUI.exe` before rebuilding — Windows locks the
 > executable while it is running.

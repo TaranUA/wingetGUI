@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0). Leave empty to only build.'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  W64DEVKIT_VERSION: 2.11.0
+
+jobs:
+  build:
+    name: Build and release
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Release tag: '$tag'"
+
+      - name: Restore w64devkit
+        id: toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: tools\w64devkit
+          key: w64devkit-${{ runner.os }}-${{ env.W64DEVKIT_VERSION }}
+
+      - name: Download w64devkit
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/skeeto/w64devkit/releases/download/v$env:W64DEVKIT_VERSION/w64devkit-x64-$env:W64DEVKIT_VERSION.7z.exe"
+          $sfx = Join-Path $env:RUNNER_TEMP 'w64devkit.sfx.exe'
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile $sfx
+          $p = Start-Process -FilePath $sfx -ArgumentList '-y', "-o$env:GITHUB_WORKSPACE\tools" -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "w64devkit extraction failed: $($p.ExitCode)" }
+          if (-not (Test-Path 'tools\w64devkit\bin\g++.exe')) { throw 'w64devkit extraction produced no compiler' }
+          Remove-Item $sfx -Force
+
+      - name: Save w64devkit cache
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: tools\w64devkit
+          key: w64devkit-${{ runner.os }}-${{ env.W64DEVKIT_VERSION }}
+
+      - name: Run parser tests
+        shell: pwsh
+        run: ./tests/run_tests.ps1
+
+      - name: Build
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WingetGUI
+          path: dist\WingetGUI.exe
+          if-no-files-found: error
+
+      - name: Publish release
+        if: steps.meta.outputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          $exe = 'dist\WingetGUI.exe'
+          Write-Host ("Asset: {0:N0} bytes" -f (Get-Item $exe).Length)
+
+          gh release view $env:TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $env:TAG exists - replacing the asset"
+            gh release upload $env:TAG $exe --repo $env:GITHUB_REPOSITORY --clobber
+          }
+          else {
+            gh release create $env:TAG $exe `
+              --repo $env:GITHUB_REPOSITORY `
+              --title "WingetGUI $env:TAG" `
+              --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'release publishing failed' }
