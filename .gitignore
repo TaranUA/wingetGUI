@@ -1,0 +1,22 @@
+# ---------------------------------------------------------------- build output
+/build/
+/dist/
+
+# --------------------------------------------------------------- local toolchain
+# Downloaded separately (about 700 MB); see README.md, section "Building".
+/tools/w64devkit/
+
+# ------------------------------------------------------- local settings / state
+WingetGUI.ini
+settings.ini
+*.log
+
+# -------------------------------------------------------------------- OS / editor
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

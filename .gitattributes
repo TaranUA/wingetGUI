@@ -1,0 +1,9 @@
+# Keep the working tree identical on every platform. The sources are already
+# LF, so checking them out as LF avoids noisy diffs.
+* text=auto eol=lf
+
+# Binary assets
+*.exe  binary
+*.ico  binary
+*.png  binary
+*.zip  binary
