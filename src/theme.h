@@ -21,6 +21,7 @@ bool IsDark();
 void ApplyWindow(HWND hwnd);   // dark title bar
 void StyleControl(HWND ctl);   // dark common-control theme for one child window
 void StyleTree(HWND root);     // StyleControl() for every descendant
+void Flush();                  // flush uxtheme colour caches after a theme switch
 
 COLORREF WindowColor();
 COLORREF FieldColor();

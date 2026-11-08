@@ -50,6 +50,19 @@ int FindToken(const std::string& s, const char* tok) {
     return -1;
 }
 
+// True when the next non-blank line of `text` starting at `pos` is the dash
+// rule that follows a real winget table header.
+bool NextLineIsDashes(const std::string& text, size_t pos) {
+    while (pos < text.size()) {
+        size_t end = text.find('\n', pos);
+        if (end == std::string::npos) end = text.size();
+        const std::string line = text.substr(pos, end - pos);
+        if (!line.empty()) return IsAllDashes(line);
+        pos = end + 1;
+    }
+    return false;
+}
+
 }  // namespace
 
 std::wstring Utf8ToWide(const std::string& s) {
@@ -132,7 +145,10 @@ std::vector<Package> ParseUpgradeOutput(const std::string& text) {
         const int a = FindToken(line, "Available");
         const int s = FindToken(line, "Source");
 
-        if (n >= 0 && i > n && a > i) {  // header row
+        // A genuine header is always followed by the dash rule. Data rows or
+        // banner text that merely contain the heading words do not, so they
+        // must not shift the column offsets.
+        if (n >= 0 && i > n && a > i && NextLineIsDashes(text, pos)) {  // header row
             colName = n;
             colId = i;
             colAvail = a;
