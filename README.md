@@ -4,7 +4,7 @@ A tiny, portable Windows GUI for `winget` — a single `.exe`, no runtime, no
 installer.
 
 ![Windows 10 and 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
-![Size](https://img.shields.io/badge/download-~80%20KB-2ea44f)
+![Size](https://img.shields.io/badge/download-~79%20KB-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![Release](https://img.shields.io/github/v/release/TaranUA/wingetGUI)](https://github.com/TaranUA/wingetGUI/releases/latest)
 [![Build](https://img.shields.io/github/actions/workflow/status/TaranUA/wingetGUI/release.yml)](https://github.com/TaranUA/wingetGUI/actions/workflows/release.yml)
@@ -26,13 +26,16 @@ There is nothing to install and no runtime to download.
 - **Selectable list** — every available update is listed and checked by
   default; uncheck the ones you don't want.
 - **Update selected** — upgrades only the checked packages, one `winget
-  upgrade --id ... --exact` per item.
-- **Update all** — runs `winget upgrade --all`.
+  upgrade --id <id> --exact --include-unknown` per item.
+- **Update all** — runs `winget upgrade --all --include-unknown`.
 - **Live log** — the raw `winget` output is shown in a terminal-style pane as
   it runs.
 - **Modern interface** — Segoe UI typography, flat rounded buttons with
   hover/pressed feedback, an accent-highlighted primary action, rounded window
   corners and a roomy list with subtle row separators.
+- **Crisp on high-DPI and mixed-DPI setups** — the app is Per-Monitor V2 aware,
+  so fonts, row heights, column widths and padding are rebuilt when the window
+  is dragged between monitors with different scale factors.
 - **Follows the Windows theme** — light or dark, with a Settings dialog to
   override it (`System` / `Light` / `Dark`).
 - **Optional elevation** — "Always run as administrator" relaunches the app
@@ -94,7 +97,7 @@ The toolchain is not committed to this repository.
    powershell -ExecutionPolicy Bypass -File .\build.ps1
    ```
 
-The result is `dist\WingetGUI.exe` (about 80 KB, statically linked).
+The result is `dist\WingetGUI.exe` (about 79 KB, statically linked).
 
 Releases are built by GitHub Actions: pushing a `v*` tag runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which restores
@@ -109,7 +112,8 @@ GitHub release.
 The `winget` output parser has unit tests that need neither `winget` nor
 administrator rights. They cover real captured `winget upgrade` output plus
 generated edge cases (multi-byte names, missing `Source` column, repeated
-tables, ANSI escapes):
+tables, ANSI escapes), and round-trip the command-line escaping through
+`CommandLineToArgvW` (57 checks):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
@@ -141,7 +145,13 @@ Build output (`build\`, `dist\`) and local settings are ignored by Git.
   table by deriving column offsets from the header row. Each row is decoded to
   UTF-16 before slicing so multi-byte package names don't shift the fields.
 - `winget.exe` is launched with `CreateProcessW` and its output is streamed
-  back to the GUI over `WM_APP` messages.
+  back to the GUI over `WM_APP` messages. Package ids are quoted with
+  `CommandLineToArgvW` rules (`winget::EscapeArg`) before the command line is
+  assembled, so the parser upstream can never be confused by a hostile id.
+- The window is Per-Monitor V2 DPI aware: `WM_DPICHANGED` rebuilds the fonts,
+  the list row height and the control layout for the monitor the window moved
+  to, with `GetDpiForWindow` / `SystemParametersInfoForDpi` supplying the
+  scaled metrics.
 - Dark mode uses the undocumented `uxtheme.dll` entry points
   (`SetPreferredAppMode`, `AllowDarkModeForWindow`, `FlushMenuThemes`) plus
   `DwmSetWindowAttribute`. Because the classic common controls don't fully
@@ -178,6 +188,7 @@ dependency. Size is kept down by:
   `__throw_*` boundaries in `src\strings.cpp`. In libstdc++, exception-raising stubs
   drag in COW strings, `std::random_device`, `std::system_error` and the full exception
   machinery; stubbing them lets the linker discard all of it (~45 KB saved).
+- Dropping the compiler identification strings (`-fno-ident`).
 - Storing the icon as PNG frames instead of raw 32-bit bitmaps.
 
 ## Regenerating the icon (optional)
@@ -204,14 +215,30 @@ powershell -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
 
 **Added**
 
-- **Per-Monitor V2 High-DPI support**: Updated manifest and window procedure (`WM_DPICHANGED`) so the window, Segoe UI typography, ListView row heights, column widths, button padding, and control geometries dynamically re-scale cleanly when moved between monitors with different display scale factors.
-- **Package ID argument escaping**: Command-line arguments constructed for `winget upgrade --id ...` are now quoted and escaped according to standard Windows `CommandLineToArgvW` rules, preventing command line parsing breakage from special characters or quotes.
-- **Argument escape unit tests**: Added comprehensive round-trip tests to `tests/parse_test.cpp` verifying argument escaping logic.
+- **Per-Monitor V2 DPI awareness.** The manifest declares `PerMonitorV2` and the
+  window handles `WM_DPICHANGED`, rebuilding fonts, list row heights, column
+  widths, button padding and control geometry for the monitor the window moved
+  to. Text stays sharp instead of being bitmap-stretched, and the layout no
+  longer overflows on high-scale displays.
+- **Safe command-line quoting.** Package IDs are escaped before being handed to
+  `winget` (standard `CommandLineToArgvW` rules), so an id containing quotes or
+  other special characters can no longer break the command line. The tests
+  parse the generated command line back with `CommandLineToArgvW` to prove the
+  round trip.
 
-**Optimized**
+**Changed**
 
-- **Dramatic binary footprint reduction**: Shrunk the executable size from ~140 KB down to ~80 KB (a ~45% reduction). Suppressed asynchronous unwind tables (`-fno-asynchronous-unwind-tables`, `-fno-unwind-tables`) to eliminate unused `.pdata` and `.xdata` SEH tables, and stubbed container throw boundaries in `src\strings.cpp` so libstdc++ exception objects, COW string instantiations, random device, and system error runtimes are dropped by `--gc-sections`.
-- **Build reliability**: `build.ps1` automatically terminates any existing running instance of `WingetGUI.exe` before linking, preventing `Permission denied` file lock errors during rebuild.
+- `build.ps1` terminates a running `WingetGUI.exe` before linking, so rebuilding
+  no longer fails with `ld.exe: cannot open output file ... Permission denied`.
+- The parser test suite grew to 57 checks.
+
+**Smaller**
+
+- `WingetGUI.exe` shrank from 148 KB (1.0.1) to 79 KB — about 46% — by
+  suppressing SEH unwind tables (`-fno-asynchronous-unwind-tables`,
+  `-fno-unwind-tables`, ~24 KB) and stubbing libstdc++'s `__throw_*` entry
+  points, which lets the linker drop the exception runtime, COW strings,
+  `std::random_device` and `std::system_error` (~45 KB).
 
 ### 1.0.1
 
