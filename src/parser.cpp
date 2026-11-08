@@ -124,6 +124,35 @@ std::string StripAnsi(const std::string& in) {
     return out;
 }
 
+std::wstring EscapeArg(const std::wstring& s) {
+    if (s.empty()) return L"\"\"";
+
+    std::wstring out;
+    out.push_back(L'"');
+
+    int backslashes = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const wchar_t c = s[i];
+        if (c == L'\\') {
+            ++backslashes;
+        } else if (c == L'"') {
+            // 2N + 1 backslashes followed by a quotation mark emit N backslashes
+            // followed by a literal quotation mark.
+            out.append(static_cast<size_t>(backslashes * 2 + 1), L'\\');
+            out.push_back(L'"');
+            backslashes = 0;
+        } else {
+            out.append(static_cast<size_t>(backslashes), L'\\');
+            backslashes = 0;
+            out.push_back(c);
+        }
+    }
+    // 2N backslashes before the closing quote emit N backslashes.
+    out.append(static_cast<size_t>(backslashes * 2), L'\\');
+    out.push_back(L'"');
+    return out;
+}
+
 std::vector<Package> ParseUpgradeOutput(const std::string& text) {
     std::vector<Package> out;
     std::vector<std::wstring> seen;
