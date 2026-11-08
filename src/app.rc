@@ -25,6 +25,20 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 208, 140, 52, 15
 END
 
+/* ------------------------------------------------------------------ message box */
+/* Custom replacement for MessageBoxW: native message boxes stay partly light
+   in dark mode no matter how they are themed, so all prompts use this dialog,
+   painted entirely by main.cpp (text + dynamic buttons). */
+IDD_MSGBOX DIALOGEX 0, 0, 244, 96
+STYLE DS_SETFONT | DS_MODALFRAME | DS_NOIDLEMSG | WS_POPUP | WS_CAPTION | WS_SYSMENU
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "",IDC_MSG_TEXT,14,8,216,68
+    PUSHBUTTON      "",IDC_MSG_BTN1,14,80,72,14
+    PUSHBUTTON      "",IDC_MSG_BTN2,90,80,72,14
+    PUSHBUTTON      "",IDC_MSG_BTN3,166,80,64,14
+END
+
 /* ------------------------------------------------------------------ version */
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION    1,0,0,0

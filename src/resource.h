@@ -5,6 +5,7 @@
 #define IDR_APP_ICON      1
 
 #define IDD_SETTINGS      101
+#define IDD_MSGBOX        102
 
 // Main window controls
 #define IDC_STATUS        1001
@@ -23,6 +24,12 @@
 #define IDC_THEME_DARK    1103
 #define IDC_RUN_ADMIN     1104
 #define IDC_SETTINGS_HINT 1105
+
+// Message box dialog controls
+#define IDC_MSG_TEXT      1110
+#define IDC_MSG_BTN1      1111
+#define IDC_MSG_BTN2      1112
+#define IDC_MSG_BTN3      1113
 
 // windres does not see the SDK's IDC_STATIC definition
 #ifndef IDC_STATIC

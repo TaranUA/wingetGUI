@@ -14,11 +14,13 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <shellapi.h>
 
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <cwchar>
 #include <cstring>
 
@@ -51,6 +53,10 @@ const wchar_t* const kUpdateAllArgs =
     L"upgrade --all --include-unknown --accept-package-agreements "
     L"--accept-source-agreements --disable-interactivity";
 
+// Trim whole leading lines from the log once it exceeds this size, so a long
+// `winget upgrade` cannot grow the edit control without bound.
+const int kMaxLogChars = 2 * 1024 * 1024;
+
 // ---------------------------------------------------------------- data types
 using winget::Package;
 
@@ -82,10 +88,17 @@ HFONT g_fontHeader = nullptr;
 settings::Values g_settings;
 std::vector<Package> g_packages;
 
-volatile LONG g_busy = 0;    // 0 = idle, 1 = a worker is running
-volatile LONG g_alive = 1;   // 0 once the window is gone
+// UI flags shared with worker threads. std::atomic makes the cross-thread
+// access well-defined; all usage is plain 0/1 assignment and read.
+std::atomic<int> g_busy{0};    // 0 = idle, 1 = a worker is running
+std::atomic<int> g_alive{1};   // 0 once the window is gone
 bool g_elevated = false;
 bool g_filling = false;      // suppress notifications while populating
+
+// Groups every winget child process so a close during an update can either
+// cancel the run (TerminateJobObject) or release it to finish in the
+// background (no kill-on-close, so closing the handle is harmless).
+HANDLE g_job = nullptr;
 
 struct ButtonVisual {
     bool primary = false;
@@ -97,6 +110,8 @@ void RefreshButtons();
 void UpdateStatusText();
 void ApplyThemeLive();
 void PostLog(const std::wstring& text);
+int DarkMessageBox(HWND owner, const wchar_t* text, const wchar_t* caption,
+                   unsigned int type);
 
 LRESULT CALLBACK HeaderSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                 UINT_PTR id, DWORD_PTR ref);
@@ -136,6 +151,16 @@ bool IsElevated() {
     const BOOL ok = GetTokenInformation(token, TokenElevation, &elevation, size, &size);
     CloseHandle(token);
     return ok && elevation.TokenIsElevated != 0;
+}
+
+// Scales a 96-dpi design size by the system DPI. The process is system-aware
+// (see app.manifest), so one value per session is correct.
+int ScaleForDpi(HWND hwnd, int value) {
+    HDC dc = GetDC(hwnd);
+    if (!dc) return value;
+    const int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+    ReleaseDC(hwnd, dc);
+    return (dpi > 0 && dpi != 96) ? MulDiv(value, dpi, 96) : value;
 }
 
 bool RelaunchElevated() {
@@ -190,13 +215,13 @@ using winget::StripAnsi;
 using winget::Utf8ToWide;
 
 void PostLog(const std::wstring& text) {
-    if (!g_alive || !g_hwnd) return;
+    if (!g_alive.load() || !g_hwnd) return;
     wchar_t* p = DupStr(text);
     if (!PostMessageW(g_hwnd, WM_APP_LOGTEXT, 0, reinterpret_cast<LPARAM>(p))) delete[] p;
 }
 
 void PostStatus(const std::wstring& text) {
-    if (!g_alive || !g_hwnd) return;
+    if (!g_alive.load() || !g_hwnd) return;
     wchar_t* p = DupStr(text);
     if (!PostMessageW(g_hwnd, WM_APP_STATUS, 0, reinterpret_cast<LPARAM>(p))) delete[] p;
 }
@@ -204,6 +229,7 @@ void PostStatus(const std::wstring& text) {
 // ---------------------------------------------------------------- log output
 void AppendLog(const std::wstring& text) {
     if (!g_log || text.empty()) return;
+
     const int len = GetWindowTextLengthW(g_log);
     SendMessageW(g_log, EM_SETSEL, static_cast<WPARAM>(len), static_cast<LPARAM>(len));
 
@@ -213,6 +239,26 @@ void AppendLog(const std::wstring& text) {
     SendMessageW(g_log, EM_SETREADONLY, FALSE, 0);
     SendMessageW(g_log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(chunk.c_str()));
     SendMessageW(g_log, EM_SETREADONLY, TRUE, 0);
+
+    // Trim whole leading lines once the text is past the cap, so a long
+    // `winget upgrade` cannot grow the log without bound.
+    const int grown = GetWindowTextLengthW(g_log);
+    if (grown > kMaxLogChars) {
+        const int line = static_cast<int>(SendMessageW(
+            g_log, EM_LINEFROMCHAR, static_cast<WPARAM>(grown - kMaxLogChars), 0));
+        const int cut = static_cast<int>(SendMessageW(
+            g_log, EM_LINEINDEX, static_cast<WPARAM>(line + 1), 0));
+        if (cut > 0) {
+            SendMessageW(g_log, EM_SETREADONLY, FALSE, 0);
+            SendMessageW(g_log, EM_SETSEL, 0, static_cast<WPARAM>(cut));
+            SendMessageW(g_log, EM_REPLACESEL, FALSE, reinterpret_cast<LPARAM>(L""));
+            SendMessageW(g_log, EM_SETREADONLY, TRUE, 0);
+        }
+    }
+
+    // Trimming invalidates the caret selection placed before the append.
+    const int end = GetWindowTextLengthW(g_log);
+    SendMessageW(g_log, EM_SETSEL, static_cast<WPARAM>(end), static_cast<LPARAM>(end));
     SendMessageW(g_log, EM_SCROLLCARET, 0, 0);
 }
 
@@ -303,7 +349,7 @@ private:
 
     void FlushBatch() {
         if (batch_.empty()) return;
-        if (g_alive && g_hwnd) {
+        if (g_alive.load() && g_hwnd) {
             wchar_t* p = DupStr(batch_);
             if (!PostMessageW(g_hwnd, WM_APP_LOGTEXT, 0, reinterpret_cast<LPARAM>(p))) delete[] p;
         }
@@ -348,9 +394,14 @@ bool RunProcess(const std::wstring& cmd, OutputParser& sink, DWORD& exitCode, DW
 
     CloseHandle(pi.hThread);
 
+    // Add the child to the job so a close during the run can cancel it.
+    // The cmd.exe fallback wrapper joins the job too, and winget inherits
+    // the association from it.
+    if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);
+
     char buf[8192];
     DWORD n = 0;
-    while (g_alive && ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n > 0) {
+    while (g_alive.load() && ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n > 0) {
         sink.Feed(buf, static_cast<size_t>(n));
     }
 
@@ -403,7 +454,7 @@ bool DoCheck(std::wstring& note) {
 
     std::vector<Package>* result =
         new std::vector<Package>(winget::ParseUpgradeOutput(captured));
-    if (!g_alive || !g_hwnd) {
+    if (!g_alive.load() || !g_hwnd) {
         delete result;
         return false;
     }
@@ -468,7 +519,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
         DoCheck(note);
     }
 
-    if (g_alive && g_hwnd) {
+    if (g_alive.load() && g_hwnd) {
         PostMessageW(g_hwnd, WM_APP_FINISHED, 0,
                      note.empty() ? 0 : reinterpret_cast<LPARAM>(DupStr(note)));
     }
@@ -478,10 +529,22 @@ DWORD WINAPI WorkerThread(LPVOID param) {
 }
 
 void BeginWork(WorkItem* work, const std::wstring& status) {
-    if (InterlockedCompareExchange(&g_busy, 1, 0) != 0) {
+    int expected = 0;
+    if (!g_busy.compare_exchange_strong(expected, 1)) {
+        // A check or update is already running. Say so instead of dropping the
+        // request without a trace - the button stays enabled, so this is how a
+        // second click can land here.
+        PostStatus(L"Another operation is running - try again once it finishes.");
         delete work;
         return;
     }
+
+    if (!g_job) {
+        // No kill-on-close limit: releasing the job (plain CloseHandle at
+        // destroy) must let a running winget finish on its own.
+        g_job = CreateJobObjectW(nullptr, nullptr);
+    }
+
     SetWindowTextW(g_status, status.c_str());
     RefreshButtons();
 
@@ -489,7 +552,7 @@ void BeginWork(WorkItem* work, const std::wstring& status) {
     if (thread) {
         CloseHandle(thread);
     } else {
-        InterlockedExchange(&g_busy, 0);
+        g_busy.store(0, std::memory_order_release);
         delete work;
         RefreshButtons();
     }
@@ -506,7 +569,7 @@ int CountChecked() {
 }
 
 void UpdateStatusText() {
-    if (g_busy || !g_status) return;
+    if (g_busy.load() || !g_status) return;
 
     const int total = ListView_GetItemCount(g_list);
     const int checked = CountChecked();
@@ -525,7 +588,7 @@ void UpdateStatusText() {
 }
 
 void RefreshButtons() {
-    const bool idle = (g_busy == 0);
+    const bool idle = (g_busy.load() == 0);
     const int checked = CountChecked();
     const int total = ListView_GetItemCount(g_list);
 
@@ -543,9 +606,10 @@ void LayoutColumns() {
     GetClientRect(g_list, &rc);
     const int total = rc.right - rc.left;
 
-    const int wId = 300, wCur = 110, wAvail = 110, wSrc = 100;
-    int wName = total - (wId + wCur + wAvail + wSrc) - 24;
-    if (wName < 150) wName = 150;
+    const int wId = ScaleForDpi(g_list, 300), wCur = ScaleForDpi(g_list, 110),
+              wAvail = ScaleForDpi(g_list, 110), wSrc = ScaleForDpi(g_list, 100);
+    int wName = total - (wId + wCur + wAvail + wSrc) - ScaleForDpi(g_list, 24);
+    if (wName < ScaleForDpi(g_list, 150)) wName = ScaleForDpi(g_list, 150);
 
     ListView_SetColumnWidth(g_list, 0, wName);
     ListView_SetColumnWidth(g_list, 1, wId);
@@ -620,8 +684,8 @@ void StartCheck() {
 void StartSelected() {
     std::vector<std::wstring> ids = CollectSelectedIds();
     if (ids.empty()) {
-        MessageBoxW(g_hwnd, L"Select at least one package to update.",
-                    kTitle, MB_OK | MB_ICONINFORMATION);
+        DarkMessageBox(g_hwnd, L"Select at least one package to update.",
+                       kTitle, MB_OK | MB_ICONINFORMATION);
         return;
     }
     WorkItem* work = new WorkItem();
@@ -633,8 +697,8 @@ void StartAll() {
     const int total = ListView_GetItemCount(g_list);
     const std::wstring question = L"Update all " + NumW(total) + L" packages now?";
 
-    if (MessageBoxW(g_hwnd, question.c_str(), L"Update all",
-                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+    if (DarkMessageBox(g_hwnd, question.c_str(), L"Update all",
+                       MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
     WorkItem* work = new WorkItem();
@@ -947,7 +1011,8 @@ void CreateControls(HWND parent) {
         GetTextMetricsW(dc, &tm);
         SelectObject(dc, oldFont);
         ReleaseDC(g_list, dc);
-        if (HIMAGELIST rows = ImageList_Create(1, tm.tmHeight + 12, ILC_COLOR32, 0, 1)) {
+        if (HIMAGELIST rows = ImageList_Create(1, tm.tmHeight + ScaleForDpi(parent, 12),
+                                               ILC_COLOR32, 0, 1)) {
             ListView_SetImageList(g_list, rows, LVSIL_SMALL);
         }
     }
@@ -1021,37 +1086,41 @@ void Layout(HWND hwnd) {
     const int W = rc.right - rc.left;
     const int H = rc.bottom - rc.top;
 
-    const int pad = 16;
-    const int statusH = 22;
-    const int btnH = 36;
-    const int gap = 10;
+    const int pad = ScaleForDpi(hwnd, 16);
+    const int statusH = ScaleForDpi(hwnd, 22);
+    const int btnH = ScaleForDpi(hwnd, 36);
+    const int gap = ScaleForDpi(hwnd, 10);
+    const int btnGap = ScaleForDpi(hwnd, 8);
 
     int logH = static_cast<int>(H * 0.26);
-    if (logH < 96) logH = 96;
-    if (logH > 280) logH = 280;
+    const int minLogH = ScaleForDpi(hwnd, 96);
+    const int maxLogH = ScaleForDpi(hwnd, 280);
+    if (logH < minLogH) logH = minLogH;
+    if (logH > maxLogH) logH = maxLogH;
 
     int y = pad;
     MoveWindow(g_status, pad, y, W - 2 * pad, statusH, TRUE);
-    y += statusH + 8;
+    y += statusH + ScaleForDpi(hwnd, 8);
 
     const int btnY = H - pad - logH - gap - btnH;
     int listH = btnY - gap - y;
-    if (listH < 60) listH = 60;
+    if (listH < ScaleForDpi(hwnd, 60)) listH = ScaleForDpi(hwnd, 60);
     MoveWindow(g_list, pad, y, W - 2 * pad, listH, TRUE);
 
     int bx = pad;
     auto place = [&](HWND btn, int w) {
         MoveWindow(btn, bx, btnY, w, btnH, TRUE);
-        bx += w + 8;
+        bx += w + btnGap;
     };
-    place(g_btnCheck, 150);
-    place(g_btnUpdate, 145);
-    place(g_btnAll, 110);
-    bx += 18;
-    place(g_btnSelAll, 100);
-    place(g_btnSelNone, 110);
+    place(g_btnCheck, ScaleForDpi(hwnd, 150));
+    place(g_btnUpdate, ScaleForDpi(hwnd, 145));
+    place(g_btnAll, ScaleForDpi(hwnd, 110));
+    bx += ScaleForDpi(hwnd, 18);
+    place(g_btnSelAll, ScaleForDpi(hwnd, 100));
+    place(g_btnSelNone, ScaleForDpi(hwnd, 110));
 
-    MoveWindow(g_btnSettings, W - pad - 110, btnY, 110, btnH, TRUE);
+    MoveWindow(g_btnSettings, W - pad - ScaleForDpi(hwnd, 110), btnY,
+               ScaleForDpi(hwnd, 110), btnH, TRUE);
 
     const int logY = btnY + btnH + gap;
     MoveWindow(g_log, pad, logY, W - 2 * pad, H - pad - logY, TRUE);
@@ -1281,6 +1350,190 @@ LRESULT CALLBACK HeaderSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
+// ---------------------------------------------------------------- dark message box
+// Native MessageBoxW dialogs stay partly light in dark mode no matter how they
+// are themed (a CBT-hook build proved the whole theming pipeline ran and the
+// dialog still had white parts), so prompts use our own dialog resource
+// (IDD_MSGBOX): palette and buttons are painted entirely by us.
+
+enum MessageBoxKind { MsgOk = 0, MsgYesNo = 1, MsgYesNoCancel = 2 };
+
+// Message spec handed to the dialog proc through DialogBoxParamW's lParam;
+// it lives on the caller's stack for the whole modal run.
+struct MsgSpec {
+    const wchar_t* caption;
+    const wchar_t* text;
+    MessageBoxKind kind;
+};
+
+MessageBoxKind KindOf(unsigned int type) {
+    if (type & MB_YESNOCANCEL) return MsgYesNoCancel;
+    if (type & MB_YESNO) return MsgYesNo;
+    return MsgOk;
+}
+
+INT_PTR CALLBACK MsgBoxProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        const auto* spec = reinterpret_cast<const MsgSpec*>(lParam);
+
+        SetWindowTextW(dlg, spec->caption);
+        theme::ApplyWindow(dlg);   // dark title bar, before the dialog is shown
+
+        RECT win0{};
+        GetWindowRect(dlg, &win0);
+        RECT cli0{};
+        GetClientRect(dlg, &cli0);
+        const int frameH = (win0.bottom - win0.top) - (cli0.bottom - cli0.top);
+        const int pad = ScaleForDpi(dlg, 14);
+        const int btnH = ScaleForDpi(dlg, 20);
+        const int btnGap = ScaleForDpi(dlg, 8);
+
+        // Text: set first, then measure the real wrapped height and fit the
+        // window around it.
+        const HWND text = GetDlgItem(dlg, IDC_MSG_TEXT);
+        SendMessageW(text, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontUI), TRUE);
+        SetWindowTextW(text, spec->text);
+        HDC dc = GetDC(text);
+        HGDIOBJ oldFont = SelectObject(dc, g_fontUI);
+        RECT measure{0, 0, (cli0.right - cli0.left) - 2 * pad, 0};
+        DrawTextW(dc, spec->text, -1, &measure,
+                  DT_LEFT | DT_TOP | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX);
+        SelectObject(dc, oldFont);
+        ReleaseDC(text, dc);
+        MoveWindow(text, pad, pad, (cli0.right - cli0.left) - 2 * pad,
+                   measure.bottom + ScaleForDpi(dlg, 4), TRUE);
+
+        RECT win{};
+        GetWindowRect(dlg, &win);
+        const int newClientH = pad + measure.bottom + btnGap + btnH + pad;
+        SetWindowPos(dlg, nullptr, 0, 0, win.right - win.left,
+                     newClientH + frameH, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+        RECT cli{};
+        GetClientRect(dlg, &cli);
+        const int rowY = (cli.bottom - cli.top) - pad - btnH;
+
+        // Buttons, right-aligned: [0]=leftmost ... [count-1]=rightmost.
+        struct BtnSpec { const wchar_t* label; int id; bool def; };
+        static const BtnSpec kinds3[] = {  // Yes/No/Cancel: cancel is default
+            {L"Cancel and close",     IDYES,    false},
+            {L"Close, let it finish", IDNO,     false},
+            {L"Keep waiting",         IDCANCEL, true},
+        };
+        static const BtnSpec kinds2[] = {  // Yes/No: No is default
+            {L"No",  IDNO,  true},
+            {L"Yes", IDYES, false},
+        };
+        static const BtnSpec kinds1[] = {
+            {L"OK", IDOK, true},
+        };
+        // spec->kind is already the MessageBoxKind chosen by DarkMessageBox;
+        // running KindOf() on it again misreads the enum as a flag mask
+        // (MsgYesNo == 1 shares a bit with MB_YESNOCANCEL) and shows the
+        // exit dialog's buttons on every prompt.
+        const MessageBoxKind kind = spec->kind;
+        const BtnSpec* defs = kind == MsgYesNoCancel ? kinds3
+                            : kind == MsgYesNo ? kinds2
+                                               : kinds1;
+        const int count = kind == MsgYesNoCancel ? 3 : kind == MsgYesNo ? 2 : 1;
+        const int btnIds[3] = {IDC_MSG_BTN1, IDC_MSG_BTN2, IDC_MSG_BTN3};
+
+        int x = (cli.right - cli.left) - pad;
+        int defBtnId = IDCANCEL;
+        for (int i = count - 1; i >= 0; --i) {
+            const HWND btn = GetDlgItem(dlg, btnIds[i]);
+            dc = GetDC(btn);
+            oldFont = SelectObject(dc, g_fontUI);
+            SIZE extent{};
+            GetTextExtentPoint32W(dc, defs[i].label,
+                                  static_cast<int>(wcslen(defs[i].label)), &extent);
+            SelectObject(dc, oldFont);
+            ReleaseDC(btn, dc);
+
+            const int w = std::max(static_cast<int>(extent.cx) + ScaleForDpi(dlg, 28),
+                                   ScaleForDpi(dlg, 80));
+            x -= w;
+            MoveWindow(btn, x, rowY, w, btnH, TRUE);
+            x -= btnGap;
+
+            SetWindowTextW(btn, defs[i].label);
+            SetWindowLongPtrW(btn, GWLP_ID, static_cast<LONG_PTR>(defs[i].id));
+            if (defs[i].def) defBtnId = defs[i].id;
+
+            auto* visual = new ButtonVisual();
+            visual->primary = (defs[i].id == IDOK || defs[i].id == IDYES);
+            SetWindowSubclass(btn, ModernButtonSubclass,
+                              static_cast<UINT_PTR>(btnIds[i]),
+                              reinterpret_cast<DWORD_PTR>(visual));
+            SendMessageW(btn, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontUI), TRUE);
+        }
+        for (int i = count; i < 3; ++i) {
+            ShowWindow(GetDlgItem(dlg, btnIds[i]), SW_HIDE);
+        }
+        SendMessageW(dlg, DM_SETDEFID, static_cast<WPARAM>(defBtnId), 0);
+
+        // Centre on the owner.
+        RECT dlgRect{};
+        GetWindowRect(dlg, &dlgRect);
+        RECT ownerRect{};
+        GetWindowRect(g_hwnd ? g_hwnd : dlg, &ownerRect);
+        const int cx = ownerRect.left + ((ownerRect.right - ownerRect.left) -
+                                         (dlgRect.right - dlgRect.left)) / 2;
+        const int cy = ownerRect.top + ((ownerRect.bottom - ownerRect.top) -
+                                        (dlgRect.bottom - dlgRect.top)) / 2;
+        SetWindowPos(dlg, nullptr, cx, cy, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+        // Keyboard focus on the default button.
+        PostMessageW(dlg, WM_NEXTDLGCTL,
+                     reinterpret_cast<WPARAM>(GetDlgItem(dlg, defBtnId)), TRUE);
+        return TRUE;
+    }
+
+    case WM_ERASEBKGND: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rc{};
+        GetClientRect(dlg, &rc);
+        FillRect(hdc, &rc, theme::WindowBrush());
+        return 1;
+    }
+
+    case WM_CTLCOLORDLG:
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetTextColor(hdc, theme::TextColor());
+        SetBkColor(hdc, theme::WindowColor());
+        return reinterpret_cast<LRESULT>(theme::WindowBrush());
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDYES ||
+            LOWORD(wParam) == IDNO || LOWORD(wParam) == IDCANCEL) {
+            EndDialog(dlg, LOWORD(wParam));
+            return TRUE;
+        }
+        break;
+
+    case WM_CLOSE:
+        EndDialog(dlg, IDCANCEL);
+        return TRUE;
+
+    default:
+        break;
+    }
+    return FALSE;
+}
+
+int DarkMessageBox(HWND owner, const wchar_t* text, const wchar_t* caption,
+                   unsigned int type) {
+    MsgSpec spec{caption, text, KindOf(type)};
+    const INT_PTR result = DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_MSGBOX),
+                                           owner, MsgBoxProc,
+                                           reinterpret_cast<LPARAM>(&spec));
+    return result == -1 ? IDCANCEL : static_cast<int>(result);
+}
+
 // ---------------------------------------------------------------- messages
 LRESULT OnNotify(LPARAM lParam) {
     const NMHDR* header = reinterpret_cast<const NMHDR*>(lParam);
@@ -1378,8 +1631,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
-        info->ptMinTrackSize.x = 860;
-        info->ptMinTrackSize.y = 540;
+        info->ptMinTrackSize.x = ScaleForDpi(hwnd, 860);
+        info->ptMinTrackSize.y = ScaleForDpi(hwnd, 540);
         return 0;
     }
 
@@ -1424,7 +1677,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_APP_FINISHED: {
         wchar_t* note = reinterpret_cast<wchar_t*>(lParam);
-        InterlockedExchange(&g_busy, 0);
+        g_busy.store(0, std::memory_order_release);
         RefreshButtons();
         if (note) {
             SetWindowTextW(g_status, note);
@@ -1454,18 +1707,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return reinterpret_cast<LRESULT>(theme::WindowBrush());
     }
 
-    case WM_CLOSE:
-        if (g_busy) {
-            if (MessageBoxW(hwnd, L"An update is still running. Close anyway?",
-                            kTitle, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
-                return 0;
-            }
+    case WM_CLOSE: {
+        if (g_busy.load()) {
+            const int choice = DarkMessageBox(
+                hwnd,
+                L"An update is still running.\n\n"
+                L"Yes - cancel winget and close now. A partially installed\n"
+                L"package may need reinstallation.\n"
+                L"No - close and let winget finish in the background.\n"
+                L"Cancel - keep the window open.",
+                kTitle, MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
+            if (choice == IDCANCEL) return 0;
+            if (choice == IDYES && g_job) TerminateJobObject(g_job, 1);
         }
         DestroyWindow(hwnd);
         return 0;
+    }
 
     case WM_DESTROY:
-        InterlockedExchange(&g_alive, 0);
+        g_alive.store(0, std::memory_order_release);
+        if (g_job) {
+            CloseHandle(g_job);  // no kill-on-close: winget may keep running
+            g_job = nullptr;
+        }
         if (g_fontUI && g_fontUI != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(g_fontUI);
         if (g_fontMono && g_fontMono != g_fontUI) DeleteObject(g_fontMono);
         if (g_fontHeader && g_fontHeader != g_fontUI) DeleteObject(g_fontHeader);
@@ -1533,8 +1797,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
         return 1;
     }
 
-    const int width = 940;
-    const int height = 640;
+    const int width = ScaleForDpi(nullptr, 940);
+    const int height = ScaleForDpi(nullptr, 640);
     const int x = (GetSystemMetrics(SM_CXSCREEN) - width) / 2;
     const int y = (GetSystemMetrics(SM_CYSCREEN) - height) / 2;
 

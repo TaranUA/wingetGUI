@@ -155,6 +155,9 @@ Build output (`build\`, `dist\`) and local settings are ignored by Git.
 - The parser depends on `winget`'s human-readable table layout. A future
   `winget` release that changes the columns may need a parser update — the unit
   tests make that easy to spot.
+- Package and source agreements shown by `winget` are accepted automatically
+  (`--accept-package-agreements`), matching the app's no-prompt behaviour.
+  `winget` never pauses to display them.
 - The binary is unsigned, so SmartScreen may warn on first launch.
 
 ## Keeping it small
@@ -194,6 +197,27 @@ submitting a change:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
 ```
+
+## Changelog
+
+### 1.0.1
+
+- **Fixed** — the "Always run as administrator" checkbox could appear
+  unchecked in Settings after an elevated relaunch: a stale, read-only
+  `WingetGUI.ini` left next to the executable shadowed the settings saved to
+  `%LOCALAPPDATA%`. A non-writable portable file is now ignored on load.
+- **Fixed** — every yes/no prompt (for example the "Update all N packages
+  now?" confirmation) displayed the exit dialog's three buttons because the
+  message-box kind was classified twice, misreading the `MsgYesNo` enum as a
+  flag mask.
+- **Changed** — settings are saved atomically (written to a temporary file,
+  then swapped over the real one), so an interrupted save can no longer leave
+  a half-updated INI behind.
+- **Removed** — leftover `[dbg]` diagnostic lines from the startup log.
+
+### 1.0.0
+
+- Initial release.
 
 ## License
 

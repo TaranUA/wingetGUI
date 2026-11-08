@@ -186,6 +186,22 @@ void TestBannerBeforeTable() {
     if (pkgs.size() == 1) CheckW(pkgs[0].id, L"Vendor.Alpha", "id");
 }
 
+void TestHeaderWordsInData() {
+    std::printf("notice line with header-shaped words is ignored\n");
+    std::string text = MakeTable({{"Alpha", "Vendor.Alpha", "1.0.0", "2.0.0", "winget"}});
+    // A data-line-positioned banner carrying the heading words: without the
+    // dash-rule guard it would reset the column offsets and lose later rows.
+    text += "  Name Id Version Available are column headers.  \n";
+    text += MakeTable({{"Beta", "Vendor.Beta", "1.0.0", "3.0.0", "winget"}});
+
+    const auto pkgs = ParseUpgradeOutput(text);
+    CheckSize(pkgs.size(), 2, "rows from both sections");
+    if (pkgs.size() == 2) {
+        CheckW(pkgs[0].id, L"Vendor.Alpha", "first section id");
+        CheckW(pkgs[1].id, L"Vendor.Beta", "second section id after fake header");
+    }
+}
+
 void TestDuplicates() {
     std::printf("duplicate ids are collapsed\n");
     std::string text = MakeTable({
@@ -215,6 +231,7 @@ int main() {
     TestTwoSections();
     TestNoSourceColumn();
     TestBannerBeforeTable();
+    TestHeaderWordsInData();
     TestDuplicates();
     TestAnsiStripping();
 

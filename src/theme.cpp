@@ -12,8 +12,16 @@ HBRUSH g_fieldBrush = nullptr;
 const COLORREF kDarkWindow  = RGB(32, 32, 32);
 const COLORREF kDarkField   = RGB(25, 25, 25);
 const COLORREF kDarkText    = RGB(236, 236, 236);
-const COLORREF kDarkSelBk   = RGB(0, 95, 184);
 const COLORREF kDarkSelText = RGB(255, 255, 255);
+const COLORREF kFallbackAccent = RGB(0, 120, 212);  // Windows 10 default blue
+
+// Accent-derived colours, set by Init(). Following the user's accent keeps
+// the primary buttons and selection highlights in step with personalisation;
+// the fallback covers machines where the DWM cannot report the colour.
+COLORREF g_accent = kFallbackAccent;
+COLORREF g_accentHover = RGB(16, 118, 205);
+COLORREF g_accentPressed = RGB(0, 98, 176);
+COLORREF g_darkSelection = RGB(0, 95, 184);
 
 // SetPreferredAppMode values
 enum PreferredAppMode { AppModeDefault = 0, AppModeAllowDark = 1,
@@ -68,6 +76,24 @@ void AllowDarkModeForWindow(HWND hwnd, BOOL allow) {
     if (fn) fn(hwnd, allow);
 }
 
+// Scales every channel by num/den, clamped: BrighterBy with num>den, DarkerBy
+// with num<den.
+COLORREF BrighterBy(COLORREF c, int num, int den) {
+    auto ch = [num, den](int v) -> int {
+        v = v * num / den;
+        return v > 255 ? 255 : v;
+    };
+    return RGB(ch(GetRValue(c)), ch(GetGValue(c)), ch(GetBValue(c)));
+}
+
+COLORREF DarkerBy(COLORREF c, int num, int den) {
+    auto ch = [num, den](int v) -> int {
+        v = v * num / den;
+        return v < 0 ? 0 : v;
+    };
+    return RGB(ch(GetRValue(c)), ch(GetGValue(c)), ch(GetBValue(c)));
+}
+
 }  // namespace
 
 bool SystemPrefersDark() {
@@ -87,6 +113,24 @@ bool SystemPrefersDark() {
 
 void Init(bool dark) {
     g_dark = dark;
+
+    // The user's accent colour, as the DWM reports it for glass composition.
+    // The value is in 0x00BBGGRR layout, i.e. a plain COLORREF.
+    DWORD color = 0;
+    BOOL opaque = FALSE;
+    if (SUCCEEDED(DwmGetColorizationColor(&color, &opaque))) {
+        const COLORREF fromSystem = static_cast<COLORREF>(color & 0x00FFFFFF);
+        if (fromSystem != 0) g_accent = fromSystem;
+    } else {
+        g_accent = kFallbackAccent;
+    }
+
+    // Hover is a touch lighter and pressed a touch darker, in both themes;
+    // the dark selection background is a darker variant of the same accent.
+    g_accentHover   = BrighterBy(g_accent, 9, 8);
+    g_accentPressed = DarkerBy(g_accent, 7, 8);
+    g_darkSelection = DarkerBy(g_accent, 4, 5);
+
     SetPreferredAppMode(dark ? AppModeForceDark : AppModeForceLight);
     FlushMenuThemes();
 }
@@ -127,16 +171,19 @@ void StyleTree(HWND root) {
     }, 0);
 }
 
+void Flush() {
+    FlushMenuThemes();
+}
+
 COLORREF WindowColor()     { return g_dark ? kDarkWindow : GetSysColor(COLOR_BTNFACE); }
 COLORREF FieldColor()      { return g_dark ? kDarkField  : GetSysColor(COLOR_WINDOW); }
 COLORREF TextColor()       { return g_dark ? kDarkText   : GetSysColor(COLOR_BTNTEXT); }
 COLORREF FieldTextColor()  { return g_dark ? kDarkText   : GetSysColor(COLOR_WINDOWTEXT); }
 COLORREF SelectionTextColor() { return g_dark ? kDarkSelText : GetSysColor(COLOR_HIGHLIGHTTEXT); }
-COLORREF SelectionBkColor()   { return g_dark ? kDarkSelBk   : GetSysColor(COLOR_HIGHLIGHT); }
-
-COLORREF AccentColor()        { return g_dark ? RGB(0, 120, 212) : RGB(0, 103, 192); }
-COLORREF AccentHoverColor()   { return g_dark ? RGB(24, 138, 227) : RGB(16, 118, 205); }
-COLORREF AccentPressedColor() { return g_dark ? RGB(0, 98, 176)   : RGB(0, 86, 160); }
+COLORREF SelectionBkColor()   { return g_dark ? g_darkSelection : GetSysColor(COLOR_HIGHLIGHT); }
+COLORREF AccentColor()        { return g_accent; }
+COLORREF AccentHoverColor()   { return g_accentHover; }
+COLORREF AccentPressedColor() { return g_accentPressed; }
 COLORREF HoverColor()         { return g_dark ? RGB(48, 48, 48)   : RGB(242, 242, 242); }
 COLORREF PressedColor()       { return g_dark ? RGB(60, 60, 60)   : RGB(228, 228, 228); }
 COLORREF BorderColor()        { return g_dark ? RGB(72, 72, 72)   : RGB(200, 200, 200); }
