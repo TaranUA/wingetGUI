@@ -11,7 +11,7 @@ New-Item -ItemType Directory -Force -Path $obj | Out-Null
 
 $exe = Join-Path $obj 'parse_test.exe'
 & (Join-Path $bin 'g++.exe') -std=c++17 -O2 -Wall -Wextra -o $exe `
-    (Join-Path $root 'tests\parse_test.cpp') (Join-Path $root 'src\parser.cpp')
+    (Join-Path $root 'tests\parse_test.cpp') (Join-Path $root 'src\parser.cpp') -lshell32
 if ($LASTEXITCODE -ne 0) { throw 'test build failed' }
 
 & $exe

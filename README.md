@@ -4,7 +4,7 @@ A tiny, portable Windows GUI for `winget` — a single `.exe`, no runtime, no
 installer.
 
 ![Windows 10 and 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
-![Size](https://img.shields.io/badge/download-~140%20KB-2ea44f)
+![Size](https://img.shields.io/badge/download-~80%20KB-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![Release](https://img.shields.io/github/v/release/TaranUA/wingetGUI)](https://github.com/TaranUA/wingetGUI/releases/latest)
 [![Build](https://img.shields.io/github/actions/workflow/status/TaranUA/wingetGUI/release.yml)](https://github.com/TaranUA/wingetGUI/actions/workflows/release.yml)
@@ -94,7 +94,7 @@ The toolchain is not committed to this repository.
    powershell -ExecutionPolicy Bypass -File .\build.ps1
    ```
 
-The result is `dist\WingetGUI.exe` (about 140 KB, statically linked).
+The result is `dist\WingetGUI.exe` (about 80 KB, statically linked).
 
 Releases are built by GitHub Actions: pushing a `v*` tag runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which restores
@@ -169,15 +169,15 @@ dependency. Size is kept down by:
   own section and letting the linker garbage-collect everything that is not
   reachable (`--gc-sections`).
 - Building without C++ exceptions and RTTI (`-fno-exceptions`, `-fno-rtti`),
-  which neither the UI nor the parser uses.
+  and suppressing SEH unwind tables (`-fno-asynchronous-unwind-tables`,
+  `-fno-unwind-tables`), which removes unused `.pdata` and `.xdata` sections (~24 KB).
 - Disabling thread-safe local statics (`-fno-threadsafe-statics`): the only
   function-local static is the `uxtheme.dll` handle, which is loaded on the UI
   thread.
-- Explicitly instantiating `std::string` and `std::wstring` in
-  `src\strings.cpp`. libstdc++'s precompiled string objects put every member
-  function in one section, so touching any of them pulls in the whole class;
-  instantiating them in our own object lets the linker keep only the members
-  that are actually used.
+- Explicitly instantiating `std::string` and `std::wstring` and stubbing libstdc++'s
+  `__throw_*` boundaries in `src\strings.cpp`. In libstdc++, exception-raising stubs
+  drag in COW strings, `std::random_device`, `std::system_error` and the full exception
+  machinery; stubbing them lets the linker discard all of it (~45 KB saved).
 - Storing the icon as PNG frames instead of raw 32-bit bitmaps.
 
 ## Regenerating the icon (optional)
@@ -199,6 +199,19 @@ powershell -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
 ```
 
 ## Changelog
+
+### 1.0.2
+
+**Added**
+
+- **Per-Monitor V2 High-DPI support**: Updated manifest and window procedure (`WM_DPICHANGED`) so the window, Segoe UI typography, ListView row heights, column widths, button padding, and control geometries dynamically re-scale cleanly when moved between monitors with different display scale factors.
+- **Package ID argument escaping**: Command-line arguments constructed for `winget upgrade --id ...` are now quoted and escaped according to standard Windows `CommandLineToArgvW` rules, preventing command line parsing breakage from special characters or quotes.
+- **Argument escape unit tests**: Added comprehensive round-trip tests to `tests/parse_test.cpp` verifying argument escaping logic.
+
+**Optimized**
+
+- **Dramatic binary footprint reduction**: Shrunk the executable size from ~140 KB down to ~80 KB (a ~45% reduction). Suppressed asynchronous unwind tables (`-fno-asynchronous-unwind-tables`, `-fno-unwind-tables`) to eliminate unused `.pdata` and `.xdata` SEH tables, and stubbed container throw boundaries in `src\strings.cpp` so libstdc++ exception objects, COW string instantiations, random device, and system error runtimes are dropped by `--gc-sections`.
+- **Build reliability**: `build.ps1` automatically terminates any existing running instance of `WingetGUI.exe` before linking, preventing `Permission denied` file lock errors during rebuild.
 
 ### 1.0.1
 

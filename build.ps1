@@ -28,6 +28,9 @@ foreach ($tool in @('g++.exe', 'windres.exe')) {
 
 New-Item -ItemType Directory -Force -Path $obj, $dist | Out-Null
 
+# Terminate any running instance so Windows does not lock dist\WingetGUI.exe during link
+Get-Process -Name 'WingetGUI' -ErrorAction SilentlyContinue | Stop-Process -Force
+
 Write-Host 'Compiling resources...'
 & (Join-Path $bin 'windres.exe') -I $src (Join-Path $src 'app.rc') -O coff -o (Join-Path $obj 'app.res.o')
 if ($LASTEXITCODE -ne 0) { throw 'windres failed' }
@@ -43,11 +46,15 @@ $sources = @('main.cpp', 'parser.cpp', 'settings.cpp', 'theme.cpp', 'strings.cpp
 #  -fno-exceptions/-fno-rtti    the app uses neither
 #  -fno-threadsafe-statics      the only function-local static (the uxtheme
 #                                module handle) is initialised on the UI thread
+#  -fno-asynchronous-unwind-tables / -fno-unwind-tables
+#                                drop .pdata / .xdata SEH unwind tables (~24 KB)
+#  -fno-ident                   drop compiler identification strings
 $compilerArgs = @(
     '-std=c++17', '-Os', '-s', '-municode', '-mwindows',
     '-Wall', '-Wextra', '-fno-strict-aliasing',
     '-ffunction-sections', '-fdata-sections',
     '-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics',
+    '-fno-asynchronous-unwind-tables', '-fno-unwind-tables', '-fno-ident',
     '-o', (Join-Path $dist 'WingetGUI.exe')
 ) + $sources + @(
     (Join-Path $obj 'app.res.o'),

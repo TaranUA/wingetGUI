@@ -153,13 +153,33 @@ bool IsElevated() {
     return ok && elevation.TokenIsElevated != 0;
 }
 
-// Scales a 96-dpi design size by the system DPI. The process is system-aware
-// (see app.manifest), so one value per session is correct.
-int ScaleForDpi(HWND hwnd, int value) {
+// Returns the DPI for the monitor containing the window (Per-Monitor V2 aware),
+// falling back to the system DPI or 96.
+int GetDpiForHwnd(HWND hwnd) {
+    using FnGetDpiForWindow = UINT (WINAPI*)(HWND);
+    static auto fnGetDpiForWindow = reinterpret_cast<FnGetDpiForWindow>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow")));
+    if (fnGetDpiForWindow && hwnd) {
+        UINT dpi = fnGetDpiForWindow(hwnd);
+        if (dpi > 0) return static_cast<int>(dpi);
+    }
+    using FnGetDpiForSystem = UINT (WINAPI*)(void);
+    static auto fnGetDpiForSystem = reinterpret_cast<FnGetDpiForSystem>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForSystem")));
+    if (fnGetDpiForSystem) {
+        UINT dpi = fnGetDpiForSystem();
+        if (dpi > 0) return static_cast<int>(dpi);
+    }
     HDC dc = GetDC(hwnd);
-    if (!dc) return value;
+    if (!dc) return 96;
     const int dpi = GetDeviceCaps(dc, LOGPIXELSX);
     ReleaseDC(hwnd, dc);
+    return (dpi > 0) ? dpi : 96;
+}
+
+// Scales a 96-dpi design size by the window's monitor DPI.
+int ScaleForDpi(HWND hwnd, int value) {
+    const int dpi = GetDpiForHwnd(hwnd);
     return (dpi > 0 && dpi != 96) ? MulDiv(value, dpi, 96) : value;
 }
 
@@ -484,7 +504,7 @@ bool DoUpdateIds(const std::vector<std::wstring>& ids, std::wstring& note) {
                    NumW(total) + L"...");
 
         const std::wstring args =
-            L"upgrade --id \"" + id + L"\" --exact --include-unknown "
+            L"upgrade --id " + winget::EscapeArg(id) + L" --exact --include-unknown "
             L"--accept-package-agreements --accept-source-agreements "
             L"--disable-interactivity";
         LogCommand(args);
@@ -829,24 +849,62 @@ void ShowSettings() {
 }
 
 // ---------------------------------------------------------------- controls
-void CreateFonts() {
+void DeleteFonts() {
+    if (g_fontUI && g_fontUI != GetStockObject(DEFAULT_GUI_FONT)) {
+        DeleteObject(g_fontUI);
+        g_fontUI = nullptr;
+    }
+    if (g_fontMono && g_fontMono != g_fontUI) {
+        DeleteObject(g_fontMono);
+        g_fontMono = nullptr;
+    }
+    if (g_fontHeader && g_fontHeader != g_fontUI) {
+        DeleteObject(g_fontHeader);
+        g_fontHeader = nullptr;
+    }
+}
+
+void CreateFonts(HWND hwnd) {
+    DeleteFonts();
+
     NONCLIENTMETRICSW metrics{};
     metrics.cbSize = sizeof(metrics);
 
-    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+    const int dpi = GetDpiForHwnd(hwnd);
+
+    using FnSystemParametersInfoForDpi = BOOL (WINAPI*)(UINT, UINT, PVOID, UINT, UINT);
+    static auto fnSPIForDpi = reinterpret_cast<FnSystemParametersInfoForDpi>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"), "SystemParametersInfoForDpi")));
+
+    BOOL ok = FALSE;
+    if (fnSPIForDpi) {
+        ok = fnSPIForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, static_cast<UINT>(dpi));
+    }
+    if (!ok) {
+        ok = SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+        if (ok && dpi != 96) {
+            metrics.lfMessageFont.lfHeight = MulDiv(metrics.lfMessageFont.lfHeight, dpi, 96);
+        }
+    }
+
+    if (ok) {
         LOGFONTW ui = metrics.lfMessageFont;
-        ui.lfHeight = metrics.lfMessageFont.lfHeight - 1;  // a touch larger
+        const int tweak = MulDiv(1, dpi, 96);
+        ui.lfHeight = (ui.lfHeight < 0) ? (ui.lfHeight - tweak) : (ui.lfHeight + tweak);
         wcscpy(ui.lfFaceName, L"Segoe UI");
         g_fontUI = CreateFontIndirectW(&ui);
 
         LOGFONTW mono = metrics.lfMessageFont;
-        mono.lfHeight = metrics.lfMessageFont.lfHeight - 1;
+        mono.lfHeight = (mono.lfHeight < 0) ? (mono.lfHeight - tweak) : (mono.lfHeight + tweak);
         mono.lfWeight = FW_NORMAL;
         wcscpy(mono.lfFaceName, L"Consolas");
         g_fontMono = CreateFontIndirectW(&mono);
 
         LOGFONTW header = ui;
-        header.lfHeight = metrics.lfMessageFont.lfHeight - 2;
+        const int headerTweak = MulDiv(2, dpi, 96);
+        header.lfHeight = (metrics.lfMessageFont.lfHeight < 0)
+                              ? (metrics.lfMessageFont.lfHeight - headerTweak)
+                              : (metrics.lfMessageFont.lfHeight + headerTweak);
         header.lfWeight = FW_SEMIBOLD;
         wcscpy(header.lfFaceName, L"Segoe UI Semibold");
         g_fontHeader = CreateFontIndirectW(&header);
@@ -886,7 +944,7 @@ void PaintModernButton(HWND hwnd, HDC hdc, const ButtonVisual& v) {
         text = theme::TextColor();
     }
 
-    const int radius = 10;  // corner ellipse diameter (5 px radius)
+    const int radius = ScaleForDpi(hwnd, 10);  // corner ellipse diameter
     HBRUSH backgroundBrush = CreateSolidBrush(background);
     HPEN borderPen = CreatePen(PS_SOLID, 1, border);
     HGDIOBJ oldBrush = SelectObject(hdc, backgroundBrush);
@@ -910,7 +968,8 @@ void PaintModernButton(HWND hwnd, HDC hdc, const ButtonVisual& v) {
 
     if (focused && !disabled) {
         RECT ring = rc;
-        InflateRect(&ring, -3, -3);
+        const int ringInset = ScaleForDpi(hwnd, 3);
+        InflateRect(&ring, -ringInset, -ringInset);
         HPEN ringPen = CreatePen(PS_SOLID, 1,
                                  v.primary ? RGB(255, 255, 255) : theme::AccentColor());
         HGDIOBJ oldRingPen = SelectObject(hdc, ringPen);
@@ -983,8 +1042,37 @@ LRESULT CALLBACK ModernButtonSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM
     return DefSubclassProc(hwnd, msg, wParam, lParam);
 }
 
+void UpdateListRowHeight(HWND parent) {
+    if (!g_list) return;
+    HDC dc = GetDC(g_list);
+    HGDIOBJ oldFont = SelectObject(dc, g_fontUI);
+    TEXTMETRICW tm{};
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, oldFont);
+    ReleaseDC(g_list, dc);
+
+    const int rowH = tm.tmHeight + ScaleForDpi(parent, 12);
+    HIMAGELIST oldList = ListView_GetImageList(g_list, LVSIL_SMALL);
+    if (HIMAGELIST rows = ImageList_Create(1, rowH, ILC_COLOR32, 0, 1)) {
+        ListView_SetImageList(g_list, rows, LVSIL_SMALL);
+    }
+    if (oldList) ImageList_Destroy(oldList);
+}
+
+void ApplyFonts() {
+    HWND children[] = {g_status, g_list, g_log, g_btnCheck, g_btnUpdate, g_btnAll,
+                       g_btnSelAll, g_btnSelNone, g_btnSettings};
+    for (HWND child : children) {
+        if (child) SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontUI), TRUE);
+    }
+    if (g_log) SendMessageW(g_log, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontMono), TRUE);
+    if (HWND header = ListView_GetHeader(g_list)) {
+        SendMessageW(header, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontHeader), TRUE);
+    }
+}
+
 void CreateControls(HWND parent) {
-    CreateFonts();
+    CreateFonts(parent);
 
     g_status = CreateWindowExW(0, L"STATIC", L"Starting...",
                                WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
@@ -1004,18 +1092,7 @@ void CreateControls(HWND parent) {
 
     // A dummy 1-px-wide image list raises the row height, giving the list a
     // roomier, more modern feel without owner-drawing every row.
-    {
-        HDC dc = GetDC(g_list);
-        HGDIOBJ oldFont = SelectObject(dc, g_fontUI);
-        TEXTMETRICW tm{};
-        GetTextMetricsW(dc, &tm);
-        SelectObject(dc, oldFont);
-        ReleaseDC(g_list, dc);
-        if (HIMAGELIST rows = ImageList_Create(1, tm.tmHeight + ScaleForDpi(parent, 12),
-                                               ILC_COLOR32, 0, 1)) {
-            ListView_SetImageList(g_list, rows, LVSIL_SMALL);
-        }
-    }
+    UpdateListRowHeight(parent);
 
     struct Column { const wchar_t* text; int width; };
     const Column columns[] = {
@@ -1062,12 +1139,7 @@ void CreateControls(HWND parent) {
     g_btnSelNone  = button(L"Select none", IDC_BTN_SEL_NONE, false);
     g_btnSettings = button(L"Settings", IDC_BTN_SETTINGS, false);
 
-    HWND children[] = {g_status, g_list, g_log, g_btnCheck, g_btnUpdate, g_btnAll,
-                       g_btnSelAll, g_btnSelNone, g_btnSettings};
-    for (HWND child : children) {
-        SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontUI), TRUE);
-    }
-    SendMessageW(g_log, WM_SETFONT, reinterpret_cast<WPARAM>(g_fontMono), TRUE);
+    ApplyFonts();
 
     theme::StyleTree(parent);
     ApplyListColors();
@@ -1160,8 +1232,10 @@ LRESULT CALLBACK ThemeButtonSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
 
     const int height = rc.bottom - rc.top;
     int glyph = (height * 3) / 4;
-    if (glyph > 16) glyph = 16;
-    if (glyph < 11) glyph = 11;
+    const int maxGlyph = ScaleForDpi(hwnd, 16);
+    const int minGlyph = ScaleForDpi(hwnd, 11);
+    if (glyph > maxGlyph) glyph = maxGlyph;
+    if (glyph < minGlyph) glyph = minGlyph;
     const int gy = (height - glyph) / 2;
     const int gx = 1;
 
@@ -1201,7 +1275,7 @@ LRESULT CALLBACK ThemeButtonSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     wchar_t text[256] = {0};
     GetWindowTextW(hwnd, text, 256);
     RECT textRect = rc;
-    textRect.left = gx + glyph + 7;
+    textRect.left = gx + glyph + ScaleForDpi(hwnd, 7);
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, theme::TextColor());
     HFONT font = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
@@ -1331,8 +1405,8 @@ LRESULT CALLBACK HeaderSubclass(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, theme::TextColor());
             RECT tr = item;
-            tr.left += 5;
-            tr.right -= 4;
+            tr.left += ScaleForDpi(hwnd, 5);
+            tr.right -= ScaleForDpi(hwnd, 4);
             DrawTextW(hdc, text, -1, &tr,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -1613,6 +1687,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         Layout(hwnd);
         return 0;
 
+    case WM_DPICHANGED: {
+        const RECT* prc = reinterpret_cast<const RECT*>(lParam);
+        if (prc) {
+            SetWindowPos(hwnd, nullptr,
+                         prc->left, prc->top,
+                         prc->right - prc->left, prc->bottom - prc->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        CreateFonts(hwnd);
+        ApplyFonts();
+        UpdateListRowHeight(hwnd);
+        Layout(hwnd);
+        InvalidateRect(hwnd, nullptr, TRUE);
+        return 0;
+    }
+
     case WM_ERASEBKGND: {
         HDC hdc = reinterpret_cast<HDC>(wParam);
         RECT rc{};
@@ -1730,9 +1820,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             CloseHandle(g_job);  // no kill-on-close: winget may keep running
             g_job = nullptr;
         }
-        if (g_fontUI && g_fontUI != GetStockObject(DEFAULT_GUI_FONT)) DeleteObject(g_fontUI);
-        if (g_fontMono && g_fontMono != g_fontUI) DeleteObject(g_fontMono);
-        if (g_fontHeader && g_fontHeader != g_fontUI) DeleteObject(g_fontHeader);
+        DeleteFonts();
         PostQuitMessage(0);
         return 0;
 
@@ -1743,7 +1831,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void LogStartupBanner() {
-    PostLog(L"Winget Update Manager 1.0");
+    PostLog(L"Winget Update Manager 1.0.2");
     PostLog(theme::IsDark() ? L"Theme: dark." : L"Theme: light.");
     if (g_elevated) {
         PostLog(L"Running with administrator rights.");

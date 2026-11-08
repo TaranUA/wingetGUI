@@ -5,6 +5,9 @@
 
 #include "../src/parser.h"
 
+#include <windows.h>
+#include <shellapi.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -220,6 +223,34 @@ void TestAnsiStripping() {
     Check(StripAnsi("a\tb") == "a\tb", "tabs preserved");
 }
 
+void TestEscapeArg() {
+    std::printf("command-line argument escaping\n");
+    const std::vector<std::wstring> cases = {
+        L"Vendor.App",
+        L"Vendor App",
+        L"Vendor\"App",
+        L"Vendor\\App",
+        L"Vendor\\\"App",
+        L"Vendor\\\\\"App",
+        L"Vendor\\",
+        L"Vendor\\\\",
+        L"",
+        L"Special & | < > ^ % Characters",
+    };
+
+    for (const auto& original : cases) {
+        std::wstring escaped = winget::EscapeArg(original);
+        std::wstring cmd = L"app.exe " + escaped;
+        int numArgs = 0;
+        LPWSTR* argv = CommandLineToArgvW(cmd.c_str(), &numArgs);
+        Check(argv != nullptr && numArgs == 2, "CommandLineToArgvW split into 2 args");
+        if (argv && numArgs == 2) {
+            CheckW(argv[1], original.c_str(), "round-trip arg matches original");
+        }
+        if (argv) LocalFree(argv);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -234,6 +265,7 @@ int main() {
     TestHeaderWordsInData();
     TestDuplicates();
     TestAnsiStripping();
+    TestEscapeArg();
 
     std::printf("\n%d checks, %d failure(s)\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
