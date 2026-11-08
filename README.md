@@ -202,18 +202,55 @@ powershell -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
 
 ### 1.0.1
 
-- **Fixed** — the "Always run as administrator" checkbox could appear
-  unchecked in Settings after an elevated relaunch: a stale, read-only
-  `WingetGUI.ini` left next to the executable shadowed the settings saved to
-  `%LOCALAPPDATA%`. A non-writable portable file is now ignored on load.
-- **Fixed** — every yes/no prompt (for example the "Update all N packages
-  now?" confirmation) displayed the exit dialog's three buttons because the
+**Fixed**
+
+- Every yes/no prompt (for example the "Update all N packages now?"
+  confirmation) displayed the exit dialog's three buttons because the
   message-box kind was classified twice, misreading the `MsgYesNo` enum as a
   flag mask.
-- **Changed** — settings are saved atomically (written to a temporary file,
-  then swapped over the real one), so an interrupted save can no longer leave
-  a half-updated INI behind.
-- **Removed** — leftover `[dbg]` diagnostic lines from the startup log.
+- Native `MessageBoxW` dialogs stay partly light in dark mode no matter how
+  they are themed, so prompts kept white strips (title bar edges, button
+  faces). All prompts now use a custom, fully themed dialog instead — with
+  DPI-aware layout and the text height measured to fit the message.
+- The "Always run as administrator" checkbox could appear unchecked in
+  Settings after an elevated relaunch: a stale, read-only `WingetGUI.ini`
+  left next to the executable shadowed the settings saved to
+  `%LOCALAPPDATA%`. A non-writable portable file is now ignored on load.
+- The update-list parser could be confused by banner text that happens to
+  contain the words `Name  Id  Version  Available`: a genuine header row is
+  now required to be followed by the dash rule, so such lines no longer reset
+  the column offsets and drop later rows (covered by a new unit test).
+- A second click on an action button while an operation was already running
+  silently did nothing; it now reports "Another operation is running" in the
+  status bar.
+
+**Changed**
+
+- Settings are saved atomically (written to a temporary file, then swapped
+  over the real one), so an interrupted save can no longer leave a
+  half-updated INI behind.
+- Accent colours (primary buttons, hover/pressed shades, list selection)
+  now follow the user's Windows accent colour instead of a fixed blue, with
+  the Windows 10 default blue as fallback.
+- Layout, controls and list columns scale with the system DPI instead of
+  assuming 96 DPI.
+- Closing the window while an update runs can now really cancel it: every
+  `winget` child process is grouped in a job object, so "cancel winget and
+  close now" terminates the run, while "close and let it finish" releases it.
+- The log pane trims whole leading lines once it passes ~2 MB, so a long
+  `winget upgrade` cannot grow the edit control without bound.
+- Cross-thread UI flags (`busy`, `alive`) are proper atomics instead of
+  `volatile LONG`.
+
+**Removed**
+
+- Leftover `[dbg]` diagnostic lines from the startup log.
+
+**Infrastructure**
+
+- GitHub Actions: workflow actions updated to current major versions; the
+  toolchain cache is saved only from the default branch, where tag builds
+  can actually read it.
 
 ### 1.0.0
 
