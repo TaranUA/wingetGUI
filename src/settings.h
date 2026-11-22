@@ -13,9 +13,9 @@ struct Values {
     bool runAsAdmin = false;
 };
 
-// Settings live in WingetGUI.ini next to the executable (portable). If that
-// location is not writable, %LOCALAPPDATA%\WingetGUI\settings.ini is used.
+// An existing LocalAppData copy takes precedence. Otherwise use the portable
+// INI and fall back to LocalAppData if the portable file cannot be replaced.
 Values Load();
-void Save(const Values& values);
+bool Save(const Values& values);
 
 }  // namespace settings

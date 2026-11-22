@@ -1,5 +1,7 @@
 #Requires -Version 5.1
-# Builds and runs the parser unit tests (no winget or admin required).
+# Builds and runs the parser and Win32 runtime tests (no winget or admin required).
+param([switch]$LiveWinget)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -15,4 +17,27 @@ $exe = Join-Path $obj 'parse_test.exe'
 if ($LASTEXITCODE -ne 0) { throw 'test build failed' }
 
 & $exe
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+$testDir = Join-Path $obj ('runtime-test-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $testDir | Out-Null
+$runtime = Join-Path $testDir 'runtime_test.exe'
+try {
+    & (Join-Path $bin 'g++.exe') -std=c++17 -O2 -Wall -Wextra -municode -static -o $runtime `
+        (Join-Path $root 'tests\runtime_test.cpp') (Join-Path $root 'src\parser.cpp') `
+        (Join-Path $root 'src\settings.cpp') (Join-Path $root 'src\theme.cpp') `
+        -lcomctl32 -lshell32 -luser32 -lgdi32 -ladvapi32 -ldwmapi -luxtheme
+    if ($LASTEXITCODE -ne 0) { throw 'runtime test build failed' }
+
+    & $runtime
+    $result = $LASTEXITCODE
+    if ($result -eq 0 -and $LiveWinget) {
+        & $runtime --live-winget
+        $result = $LASTEXITCODE
+    }
+} finally {
+    Remove-Item -LiteralPath (Join-Path $testDir 'WingetGUI\settings.ini'), $runtime, `
+        (Join-Path $testDir 'WingetGUI.ini'), (Join-Path $testDir 'WingetGUI'), $testDir `
+        -ErrorAction SilentlyContinue
+}
+exit $result

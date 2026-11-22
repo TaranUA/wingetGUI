@@ -4,7 +4,7 @@ A tiny, portable Windows GUI for `winget` — a single `.exe`, no runtime, no
 installer.
 
 ![Windows 10 and 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6)
-![Size](https://img.shields.io/badge/download-~79%20KB-2ea44f)
+![Size](https://img.shields.io/badge/download-~91%20KB-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![Release](https://img.shields.io/github/v/release/TaranUA/wingetGUI)](https://github.com/TaranUA/wingetGUI/releases/latest)
 [![Build](https://img.shields.io/github/actions/workflow/status/TaranUA/wingetGUI/release.yml)](https://github.com/TaranUA/wingetGUI/actions/workflows/release.yml)
@@ -54,15 +54,14 @@ There is nothing to install and no runtime to download.
 ## Requirements
 
 - Windows 10 or Windows 11.
-- `winget` (App Installer) available on `PATH`. The app launches `winget.exe`
-  directly and falls back to `cmd.exe /d /s /c` if needed.
+- Microsoft App Installer with WinGet registered for the current user.
 - No runtime, framework, or installer. The `.exe` is statically linked.
 
 ## Settings
 
-Settings are stored in an INI file. The app prefers a portable file next to the
-executable (`WingetGUI.ini`) and falls back to
-`%LOCALAPPDATA%\WingetGUI\settings.ini` when the program folder is read-only:
+Settings are stored in `WingetGUI.ini` next to the executable. If that file
+cannot be saved, the app uses `%LOCALAPPDATA%\WingetGUI\settings.ini`. Once
+the LocalAppData file exists, it takes precedence on subsequent reads and writes.
 
 ```ini
 [ui]
@@ -97,27 +96,29 @@ The toolchain is not committed to this repository.
    powershell -ExecutionPolicy Bypass -File .\build.ps1
    ```
 
-The result is `dist\WingetGUI.exe` (about 79 KB, statically linked).
+The result is a statically linked `dist\WingetGUI.exe`.
 
-Releases are built by GitHub Actions: pushing a `v*` tag runs
+Releases are built by GitHub Actions: pushing a version tag such as `v1.0.3` runs
 [`.github/workflows/release.yml`](.github/workflows/release.yml), which restores
-the toolchain, runs the parser tests, builds, and attaches `WingetGUI.exe` to a
+the toolchain, runs the regression tests, builds, and attaches `WingetGUI.exe` to a
 GitHub release.
 
-> Close a running `WingetGUI.exe` before rebuilding — Windows locks the
-> executable while it is running.
+If Windows locks the output executable, the build reports the locked path and
+preserves the existing binary. Close that instance and run the build again.
 
 ## Tests
 
-The `winget` output parser has unit tests that need neither `winget` nor
-administrator rights. They cover real captured `winget upgrade` output plus
-generated edge cases (multi-byte names, missing `Source` column, repeated
-tables, ANSI escapes), and round-trip the command-line escaping through
-`CommandLineToArgvW` (57 checks):
+The regression suite uses captured WinGet output and test child processes. It
+covers Unicode table fields, argument quoting, failed update checks, process
+cancellation and background completion, and settings fallback. It can run
+without WinGet or administrator rights.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
 ```
+
+Run `.\tests\run_tests.ps1 -LiveWinget` to also launch registered WinGet and
+check for available updates without installing them.
 
 `tests\theme_probe.cpp` is a small diagnostic for the dark/light colour values.
 
@@ -132,7 +133,7 @@ powershell -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
 | `src\strings.cpp` | Forces the used `std::string` / `std::wstring` members to be linked individually (see below) |
 | `src\app.rc`, `resource.h`, `app.manifest`, `app.ico` | Resources, dialog, icon |
 | `build.ps1` | Compiles resources and links the executable |
-| `tests\` | Parser unit tests and a theme probe |
+| `tests\` | Parser and Win32 regression tests, plus a theme probe |
 | `tools\make_icon.py` | Regenerates `src\app.ico` (Python 3, optional) |
 | `tools\w64devkit\` | Local toolchain — downloaded, not committed |
 | `docs\` | README screenshots |
@@ -141,13 +142,14 @@ Build output (`build\`, `dist\`) and local settings are ignored by Git.
 
 ## How it works
 
-- `winget` has no machine-readable output, so the app parses its fixed-width
-  table by deriving column offsets from the header row. Each row is decoded to
-  UTF-16 before slicing so multi-byte package names don't shift the fields.
-- `winget.exe` is launched with `CreateProcessW` and its output is streamed
-  back to the GUI over `WM_APP` messages. Package ids are quoted with
-  `CommandLineToArgvW` rules (`winget::EscapeArg`) before the command line is
-  assembled, so the parser upstream can never be confused by a hostile id.
+- The app parses the fixed-width `winget upgrade` table using display-column
+  widths and requests English headings when the installed WinGet supports it.
+- The app resolves `winget.exe` from the registered App Installer package and
+  launches it directly with `CreateProcessW`. Selected updates use the ID and
+  source reported by WinGet. The app streams output to the GUI and checks the
+  command's exit code before replacing the list or reporting update results.
+- Closing during an operation can cancel the current WinGet command or let it
+  finish in the background. Remaining selected-package commands are discarded.
 - The window is Per-Monitor V2 DPI aware: `WM_DPICHANGED` rebuilds the fonts,
   the list row height and the control layout for the monitor the window moved
   to, with `GetDpiForWindow` / `SystemParametersInfoForDpi` supplying the
@@ -161,7 +163,7 @@ Build output (`build\`, `dist\`) and local settings are ignored by Git.
 
 ## Limitations
 
-- Windows only, and `winget` must be installed.
+- Windows only, and WinGet must be available through Microsoft App Installer.
 - The parser depends on `winget`'s human-readable table layout. A future
   `winget` release that changes the columns may need a parser update — the unit
   tests make that easy to spot.
@@ -202,7 +204,7 @@ python .\tools\make_icon.py
 
 ## Contributing
 
-Issues and pull requests are welcome. Please run the parser tests before
+Issues and pull requests are welcome. Please run the regression tests before
 submitting a change:
 
 ```powershell
@@ -210,6 +212,67 @@ powershell -ExecutionPolicy Bypass -File .\tests\run_tests.ps1
 ```
 
 ## Changelog
+
+### 1.0.3
+
+**Added**
+
+- **WinGet is located through App Installer.** `winget.exe` is resolved from
+  the registered `Microsoft.DesktopAppInstaller` package
+  (`FindPackagesByPackageFamily` → `GetPackagePathByFullName`) instead of
+  relying on `PATH` and a `cmd.exe` fallback, so the app also works when the
+  app-execution alias is missing or policy-restricted.
+- **Exit-code-aware results.** Update checks validate WinGet's exit code and
+  output: a failed check keeps the previous list and reports the
+  `0x8A15xxxx` code, "no applicable update" (`0x8A15002B`, `0x8A150014`) clears
+  it, and a successful exit with unreadable output is reported instead of
+  showing an empty list. Selected-package runs now report per-package failures
+  and skips with a summary.
+- **English table headings.** When `winget upgrade --help` advertises
+  `--output-locale`, the check asks for `en-US` so the fixed-width columns do
+  not depend on the system language. Builds that reject the flag at runtime
+  are retried without it.
+- **Display-column parsing.** Column offsets are computed from ICU grapheme
+  breaks and East Asian width (`ubrk_*`, `u_getIntPropertyValue`, with a
+  `GetStringTypeW` fallback), so wide package names and ellipsized cells no
+  longer shift the ID, version and source fields. Duplicate rows are collapsed
+  per (id, source) instead of per id.
+- **Runtime regression tests.** `tests\runtime_test.cpp` exercises the real
+  Win32 helpers — child process capture, cancel versus release on shutdown,
+  settings fallback, and check-result handling. `tests\run_tests.ps1` builds
+  and runs it; `-LiveWinget` adds a read-only live check against the installed
+  WinGet.
+
+**Fixed**
+
+- **Accent colour channels.** `DwmGetColorizationColor` returns `0xAARRGGBB`
+  but was used as a `COLORREF`, which swapped red and blue. The value is now
+  converted properly.
+- **Settings fallback.** Once `%LOCALAPPDATA%\WingetGUI\settings.ini` exists it
+  takes precedence for both reads and writes, so a portable INI that later
+  becomes writable can no longer shadow newer settings. Saves are atomic on the
+  destination volume, `Save()` returns a result, and the Settings dialog now
+  reports a write failure instead of closing silently.
+- **Background finishes and cancellation.** WinGet is started suspended,
+  assigned to its job object, and only then resumed, so a close cannot race the
+  assignment. After the window closes the output pipe is still drained until
+  the current command exits; choosing "No" at the close prompt lets that
+  command finish and discards the remaining selected-package commands.
+
+**Changed**
+
+- `build.ps1` no longer kills a running instance. It links to a unique staged
+  file and replaces `dist\WingetGUI.exe` atomically, so a locked output keeps
+  the previous binary and the error names the path to close.
+- CI is split into a read-only build/test job and a publish job that runs only
+  when a tag is present, with the tag validated against semver and the binary
+  handed over through `download-artifact`.
+- Settings paths use a 32K-character buffer, failed `PostMessage` calls free
+  their payloads, and the worker thread is joined on exit.
+- The suite now runs 64 parser checks plus 20 runtime checks.
+- The executable grew from 79 KB (1.0.2) to 91 KB after adding the App
+  Installer lookup and display-column parsing. ICU is loaded from Windows
+  (`System32\icu.dll`) when present and is not bundled.
 
 ### 1.0.2
 

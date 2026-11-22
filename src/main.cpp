@@ -13,6 +13,7 @@
 // ============================================================================
 
 #include <windows.h>
+#include <appmodel.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <shellapi.h>
@@ -23,6 +24,8 @@
 #include <atomic>
 #include <cwchar>
 #include <cstring>
+#include <memory>
+#include <mutex>
 
 #include "parser.h"
 #include "resource.h"
@@ -62,7 +65,7 @@ using winget::Package;
 
 struct WorkItem {
     bool updateAll = false;
-    std::vector<std::wstring> ids;
+    std::vector<Package> packages;
 };
 
 // ---------------------------------------------------------------- globals
@@ -95,10 +98,15 @@ std::atomic<int> g_alive{1};   // 0 once the window is gone
 bool g_elevated = false;
 bool g_filling = false;      // suppress notifications while populating
 
-// Groups every winget child process so a close during an update can either
-// cancel the run (TerminateJobObject) or release it to finish in the
-// background (no kill-on-close, so closing the handle is harmless).
+// The active command's job belongs to the worker. Closing the window can
+// terminate that job, or leave it running while the worker drains the pipe.
 HANDLE g_job = nullptr;
+HANDLE g_worker = nullptr;  // owned by the UI thread
+struct ProcessLock {
+    SRWLOCK lockHandle = SRWLOCK_INIT;
+    void lock() { AcquireSRWLockExclusive(&lockHandle); }
+    void unlock() { ReleaseSRWLockExclusive(&lockHandle); }
+} g_processMutex;
 
 struct ButtonVisual {
     bool primary = false;
@@ -292,6 +300,7 @@ void AppendLog(const std::wstring& text) {
 class OutputParser {
 public:
     std::string* collect = nullptr;  // optional: cleaned text for parsing
+    bool showLog = true;
 
     void Feed(const char* data, size_t n) {
         for (size_t i = 0; i < n; ++i) {
@@ -357,7 +366,7 @@ private:
             collect->append(clean);
             collect->push_back('\n');
         }
-        AddToBatch(clean);
+        if (showLog) AddToBatch(clean);
     }
 
     void AddToBatch(const std::string& clean) {
@@ -378,15 +387,28 @@ private:
 };
 
 // Runs a command, streaming combined stdout/stderr into `sink`.
-// Returns false only when the process could not be started at all.
-bool RunProcess(const std::wstring& cmd, OutputParser& sink, DWORD& exitCode, DWORD& createErr) {
+bool RunProcess(const std::wstring& executable, const std::wstring& args,
+                OutputParser& sink, DWORD& exitCode, DWORD& error) {
+    std::unique_lock lock(g_processMutex);
+    if (!g_alive.load()) { error = ERROR_CANCELLED; return false; }
+
+    // Packaged processes can start in different jobs. A fresh job can nest
+    // under each child's existing job hierarchy independently.
+    std::unique_ptr<void, decltype(&CloseHandle)> job(CreateJobObjectW(nullptr, nullptr), &CloseHandle);
+    if (!job) { error = GetLastError(); return false; }
+
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
 
     HANDLE rd = nullptr, wr = nullptr;
-    if (!CreatePipe(&rd, &wr, &sa, 0)) { createErr = GetLastError(); return false; }
-    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+    if (!CreatePipe(&rd, &wr, &sa, 0)) { error = GetLastError(); return false; }
+    if (!SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0)) {
+        error = GetLastError();
+        CloseHandle(rd);
+        CloseHandle(wr);
+        return false;
+    }
 
     HANDLE nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                              &sa, OPEN_EXISTING, 0, nullptr);
@@ -399,56 +421,87 @@ bool RunProcess(const std::wstring& cmd, OutputParser& sink, DWORD& exitCode, DW
     si.hStdInput = (nul != INVALID_HANDLE_VALUE) ? nul : nullptr;
 
     PROCESS_INFORMATION pi{};
-    std::wstring mutableCmd = cmd;
-    const BOOL ok = CreateProcessW(nullptr, &mutableCmd[0], nullptr, nullptr, TRUE,
-                                   CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
-    createErr = ok ? 0 : GetLastError();
+    std::wstring command = winget::EscapeArg(executable) + L" " + args;
+    const std::wstring directory = executable.substr(0, executable.find_last_of(L"\\/") + 1);
+    const BOOL created = nul != INVALID_HANDLE_VALUE &&
+        CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
+                       CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, directory.c_str(), &si, &pi);
+    error = created ? ERROR_SUCCESS : GetLastError();
 
     CloseHandle(wr);
     if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
 
-    if (!ok) {
+    if (!created) {
         CloseHandle(rd);
         return false;
     }
 
+    const BOOL assigned = AssignProcessToJobObject(job.get(), pi.hProcess);
+    if (!assigned || ResumeThread(pi.hThread) == DWORD(-1)) {
+        error = GetLastError();
+        PostLog(assigned ? L"[!] Could not resume the suspended WinGet process." :
+                           L"[!] Could not assign the suspended WinGet process to its cancellation job.");
+        TerminateProcess(pi.hProcess, error);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(rd);
+        return false;
+    }
     CloseHandle(pi.hThread);
-
-    // Add the child to the job so a close during the run can cancel it.
-    // The cmd.exe fallback wrapper joins the job too, and winget inherits
-    // the association from it.
-    if (g_job) AssignProcessToJobObject(g_job, pi.hProcess);
+    g_job = job.get();
+    lock.unlock();
 
     char buf[8192];
     DWORD n = 0;
-    while (g_alive.load() && ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n > 0) {
-        sink.Feed(buf, static_cast<size_t>(n));
+    // Keep draining even after the window closes so the running command can
+    // finish in the background without losing its stdout/stderr pipe.
+    while (ReadFile(rd, buf, sizeof(buf), &n, nullptr) && n > 0) {
+        if (g_alive.load()) sink.Feed(buf, static_cast<size_t>(n));
     }
 
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD ec = 0;
-    GetExitCodeProcess(pi.hProcess, &ec);
-    exitCode = ec;
+    const bool exited = WaitForSingleObject(pi.hProcess, INFINITE) == WAIT_OBJECT_0 &&
+                        GetExitCodeProcess(pi.hProcess, &exitCode);
+    if (!exited) error = GetLastError();
 
     CloseHandle(pi.hProcess);
     CloseHandle(rd);
     sink.Finish();
-    return true;
+    lock.lock();
+    g_job = nullptr;
+    return exited;
 }
 
-bool RunWinget(const std::wstring& args, OutputParser& sink, DWORD& exitCode) {
-    const std::wstring cmd = L"winget.exe " + args;
+std::wstring FindWinget() {
+    constexpr wchar_t family[] = L"Microsoft.DesktopAppInstaller_8wekyb3d8bbwe";
+    UINT32 count = 0, length = 0;
+    if (FindPackagesByPackageFamily(family, PACKAGE_FILTER_HEAD, &count, nullptr,
+                                    &length, nullptr, nullptr) != ERROR_INSUFFICIENT_BUFFER) return {};
+    std::vector<PWSTR> names(count);
+    std::wstring buffer(length, L'\0');
+    if (FindPackagesByPackageFamily(family, PACKAGE_FILTER_HEAD, &count, names.data(),
+                                    &length, buffer.data(), nullptr) != ERROR_SUCCESS) return {};
+    for (UINT32 i = 0; i < count; ++i) {
+        UINT32 size = 0;
+        if (GetPackagePathByFullName(names[i], &size, nullptr) != ERROR_INSUFFICIENT_BUFFER) continue;
+        std::wstring path(size, L'\0');
+        if (GetPackagePathByFullName(names[i], &size, path.data()) != ERROR_SUCCESS) continue;
+        path.resize(size - 1);
+        path += L"\\winget.exe";
+        const DWORD attrs = GetFileAttributesW(path.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return path;
+    }
+    return {};
+}
+
+bool RunWinget(const std::wstring& args, OutputParser& sink, DWORD& exitCode,
+                const std::wstring& executable = FindWinget()) {
+    if (executable.empty()) {
+        PostLog(L"[!] WinGet was not found in the registered Microsoft App Installer package.");
+        return false;
+    }
     DWORD err = 0;
-    if (RunProcess(cmd, sink, exitCode, err)) return true;
-
-    // App-execution aliases normally launch directly; fall back to the shell.
-    PostLog(L"[!] Could not start winget directly (error " + NumW(err) +
-            L"), retrying via cmd.exe");
-    const std::wstring wrapped = L"cmd.exe /d /s /c \"" + cmd + L"\"";
-    if (RunProcess(wrapped, sink, exitCode, err)) return true;
-
-    PostLog(L"[!] Failed to launch winget (error " + NumW(err) + L").");
-    PostLog(L"[!] Make sure Windows Package Manager (winget) is installed.");
+    if (RunProcess(executable, args, sink, exitCode, err)) return true;
+    PostLog(L"[!] Could not run WinGet (Windows error " + NumW(err) + L").");
     return false;
 }
 
@@ -458,28 +511,87 @@ void LogCommand(const std::wstring& args) {
     PostLog(L"> winget " + args);
 }
 
+constexpr DWORD kNoApplicationsFound = 0x8A150014;
+constexpr DWORD kUpdateNotApplicable = 0x8A15002B;
+constexpr DWORD kInvalidArguments = 0x8A150002;
+
+std::wstring ExitCodeText(DWORD code) {
+    constexpr wchar_t hex[] = L"0123456789ABCDEF";
+    wchar_t text[] = L"0x00000000";
+    for (int i = 9; i >= 2; --i) {
+        text[i] = hex[code & 0xF];
+        code >>= 4;
+    }
+    return text;
+}
+
+bool ReadCheckResult(DWORD exitCode, const std::string& output, std::vector<Package>& packages,
+                     std::wstring& note) {
+    if (exitCode != ERROR_SUCCESS && exitCode != kUpdateNotApplicable && exitCode != kNoApplicationsFound) {
+        note = L"Update check failed (" + ExitCodeText(exitCode) + L"). See the log for details.";
+        return false;
+    }
+    auto parsed = winget::ParseUpgradeOutput(output);
+    if (exitCode == ERROR_SUCCESS && parsed.empty() && !winget::ReportsNoUpdates(output)) {
+        note = L"Could not read WinGet's update list. See the log for details.";
+        return false;
+    }
+    packages = std::move(parsed);
+    return true;
+}
+
 bool DoCheck(std::wstring& note) {
     PostStatus(L"Checking for updates...");
+
+    const std::wstring executable = FindWinget();
+    // Remember the help result until App Installer changes its versioned path.
+    // Only the single WinGet worker accesses this cache.
+    static std::wstring probedExecutable;
+    static bool supportsOutputLocale = false;
+    if (!executable.empty() && executable != probedExecutable) {
+        std::string help;
+        OutputParser probe;
+        probe.collect = &help;
+        probe.showLog = false;
+        DWORD probeExit = 0, error = 0;
+        supportsOutputLocale = false;
+        if (RunProcess(executable, L"upgrade --help", probe, probeExit, error) && probeExit == ERROR_SUCCESS) {
+            probedExecutable = executable;
+            supportsOutputLocale = help.find("--output-locale") != std::string::npos;
+        }
+    }
 
     std::string captured;
     OutputParser sink;
     sink.collect = &captured;
-    LogCommand(kCheckArgs);
-
     DWORD exitCode = 0;
-    if (!RunWinget(kCheckArgs, sink, exitCode)) {
+    std::wstring args = kCheckArgs;
+    if (supportsOutputLocale && executable == probedExecutable) args += L" --output-locale en-US";
+    LogCommand(args);
+    if (!RunWinget(args, sink, exitCode, executable)) {
         note = L"Could not run winget.";
         return false;
     }
-
-    std::vector<Package>* result =
-        new std::vector<Package>(winget::ParseUpgradeOutput(captured));
-    if (!g_alive.load() || !g_hwnd) {
-        delete result;
-        return false;
+    if (args != kCheckArgs && exitCode == kInvalidArguments && g_alive.load()) {
+        // Some builds may list the option in help but reject it at runtime.
+        supportsOutputLocale = false;
+        captured.clear();
+        OutputParser legacySink;
+        legacySink.collect = &captured;
+        LogCommand(kCheckArgs);
+        if (!RunWinget(kCheckArgs, legacySink, exitCode, executable)) {
+            note = L"Could not run winget.";
+            return false;
+        }
     }
-    PostMessageW(g_hwnd, WM_APP_UPDATES, 0, reinterpret_cast<LPARAM>(result));
-    return true;
+    auto result = std::make_unique<std::vector<Package>>();
+    if (!ReadCheckResult(exitCode, captured, *result, note) || !g_alive.load() || !g_hwnd) return false;
+    if (PostMessageW(g_hwnd, WM_APP_UPDATES, 0, reinterpret_cast<LPARAM>(result.get()))) {
+        result.release();
+        return true;
+    }
+    note = L"Could not display the new update list.";
+    return false;
 }
 
 bool DoUpdateAll(std::wstring& note) {
@@ -492,29 +604,52 @@ bool DoUpdateAll(std::wstring& note) {
         note = L"Could not run winget.";
         return false;
     }
+    if (exitCode == kUpdateNotApplicable || exitCode == kNoApplicationsFound) {
+        note = L"WinGet found no applicable packages to update.";
+    } else if (exitCode != ERROR_SUCCESS) {
+        note = L"Update all failed (" + ExitCodeText(exitCode) + L"). See the log for details.";
+        PostLog(note);
+    }
     return true;
 }
 
-bool DoUpdateIds(const std::vector<std::wstring>& ids, std::wstring& note) {
-    const int total = static_cast<int>(ids.size());
+bool DoUpdateSelected(const std::vector<Package>& packages, std::wstring& note) {
+    const int total = static_cast<int>(packages.size());
     int index = 0;
-    for (const std::wstring& id : ids) {
+    int failed = 0, skipped = 0;
+    for (const Package& package : packages) {
+        if (!g_alive.load()) return false;
         ++index;
         PostStatus(L"Updating package " + NumW(index) + L" of " +
                    NumW(total) + L"...");
 
-        const std::wstring args =
-            L"upgrade --id " + winget::EscapeArg(id) + L" --exact --include-unknown "
+        std::wstring args =
+            L"upgrade --id " + winget::EscapeArg(package.id) + L" --exact --include-unknown "
             L"--accept-package-agreements --accept-source-agreements "
             L"--disable-interactivity";
+        if (!package.source.empty()) args += L" --source " + winget::EscapeArg(package.source);
         LogCommand(args);
 
         OutputParser sink;
         DWORD exitCode = 0;
         if (!RunWinget(args, sink, exitCode)) {
-            note = L"Could not run winget.";
-            return false;
+            note = L"Could not run winget for " + package.id + L". See the log for details.";
+            PostLog(note);
+            return index > 1;
         }
+        if (exitCode == kUpdateNotApplicable || exitCode == kNoApplicationsFound) {
+            ++skipped;
+            PostLog(L"[!] No applicable update for " + package.id + L" (" + ExitCodeText(exitCode) + L").");
+        } else if (exitCode != ERROR_SUCCESS) {
+            ++failed;
+            PostLog(L"[!] Update failed for " + package.id + L" (" + ExitCodeText(exitCode) + L").");
+        } else {
+            PostLog(L"Updated " + package.id + L".");
+        }
+    }
+    if (failed || skipped) {
+        note = NumW(total - failed - skipped) + L" updated, " + NumW(failed) + L" failed, " +
+               NumW(skipped) + L" skipped. See the log for details.";
     }
     return true;
 }
@@ -523,25 +658,24 @@ DWORD WINAPI WorkerThread(LPVOID param) {
     WorkItem* work = static_cast<WorkItem*>(param);
     std::wstring note;
 
-    if (work->updateAll) {
-        if (DoUpdateAll(note)) {
-            note.clear();
+    if (work->updateAll || !work->packages.empty()) {
+        const bool refresh = work->updateAll ? DoUpdateAll(note) : DoUpdateSelected(work->packages, note);
+        if (refresh && g_alive.load()) {
             PostStatus(L"Refreshing package list...");
-            DoCheck(note);
-        }
-    } else if (!work->ids.empty()) {
-        if (DoUpdateIds(work->ids, note)) {
-            note.clear();
-            PostStatus(L"Refreshing package list...");
-            DoCheck(note);
+            std::wstring checkNote;
+            if (!DoCheck(checkNote)) {
+                PostLog(checkNote);
+                if (note.empty()) note = checkNote;
+                else note += L" The list could not be refreshed.";
+            }
         }
     } else {
         DoCheck(note);
     }
 
     if (g_alive.load() && g_hwnd) {
-        PostMessageW(g_hwnd, WM_APP_FINISHED, 0,
-                     note.empty() ? 0 : reinterpret_cast<LPARAM>(DupStr(note)));
+        wchar_t* message = note.empty() ? nullptr : DupStr(note);
+        if (!PostMessageW(g_hwnd, WM_APP_FINISHED, 0, reinterpret_cast<LPARAM>(message))) delete[] message;
     }
 
     delete work;
@@ -559,22 +693,15 @@ void BeginWork(WorkItem* work, const std::wstring& status) {
         return;
     }
 
-    if (!g_job) {
-        // No kill-on-close limit: releasing the job (plain CloseHandle at
-        // destroy) must let a running winget finish on its own.
-        g_job = CreateJobObjectW(nullptr, nullptr);
-    }
-
     SetWindowTextW(g_status, status.c_str());
     RefreshButtons();
 
-    HANDLE thread = CreateThread(nullptr, 0, WorkerThread, work, 0, nullptr);
-    if (thread) {
-        CloseHandle(thread);
-    } else {
+    g_worker = CreateThread(nullptr, 0, WorkerThread, work, 0, nullptr);
+    if (!g_worker) {
         g_busy.store(0, std::memory_order_release);
         delete work;
         RefreshButtons();
+        SetWindowTextW(g_status, L"Could not start the WinGet worker.");
     }
 }
 
@@ -670,8 +797,8 @@ void FillList() {
     RefreshButtons();
 }
 
-std::vector<std::wstring> CollectSelectedIds() {
-    std::vector<std::wstring> ids;
+std::vector<Package> CollectSelectedPackages() {
+    std::vector<Package> packages;
     const int n = ListView_GetItemCount(g_list);
     for (int i = 0; i < n; ++i) {
         if (!ListView_GetCheckState(g_list, i)) continue;
@@ -682,9 +809,9 @@ std::vector<std::wstring> CollectSelectedIds() {
         if (!ListView_GetItem(g_list, &item)) continue;
 
         const size_t index = static_cast<size_t>(item.lParam);
-        if (index < g_packages.size()) ids.push_back(g_packages[index].id);
+        if (index < g_packages.size()) packages.push_back(g_packages[index]);
     }
-    return ids;
+    return packages;
 }
 
 void SetAllChecks(BOOL checked) {
@@ -702,22 +829,19 @@ void StartCheck() {
 }
 
 void StartSelected() {
-    std::vector<std::wstring> ids = CollectSelectedIds();
-    if (ids.empty()) {
+    std::vector<Package> packages = CollectSelectedPackages();
+    if (packages.empty()) {
         DarkMessageBox(g_hwnd, L"Select at least one package to update.",
                        kTitle, MB_OK | MB_ICONINFORMATION);
         return;
     }
     WorkItem* work = new WorkItem();
-    work->ids = std::move(ids);
+    work->packages = std::move(packages);
     BeginWork(work, L"Updating selected packages...");
 }
 
 void StartAll() {
-    const int total = ListView_GetItemCount(g_list);
-    const std::wstring question = L"Update all " + NumW(total) + L" packages now?";
-
-    if (DarkMessageBox(g_hwnd, question.c_str(), L"Update all",
+    if (DarkMessageBox(g_hwnd, L"Run WinGet's bulk upgrade for all eligible packages?", L"Update all",
                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
         return;
     }
@@ -816,8 +940,12 @@ INT_PTR CALLBACK SettingsProc(HWND dlg, UINT msg, WPARAM wParam, LPARAM) {
             const bool themeChanged = (values.theme != g_settings.theme);
             const bool wantElevation = values.runAsAdmin && !g_elevated;
 
+            if (!settings::Save(values)) {
+                DarkMessageBox(dlg, L"Could not save settings. Check that the settings directory is writable.",
+                               kTitle, MB_OK | MB_ICONERROR);
+                return TRUE;
+            }
             g_settings = values;
-            settings::Save(g_settings);
             EndDialog(dlg, IDOK);
 
             if (themeChanged) ApplyThemeLive();
@@ -1673,6 +1801,13 @@ LRESULT OnCommand(WPARAM wParam) {
     return 0;
 }
 
+bool StopLaunching(bool cancel) {
+    std::lock_guard lock(g_processMutex);
+    if (cancel && g_job && !TerminateJobObject(g_job, ERROR_CANCELLED)) return false;
+    g_alive.store(0);
+    return true;
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE:
@@ -1767,6 +1902,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_APP_FINISHED: {
         wchar_t* note = reinterpret_cast<wchar_t*>(lParam);
+        if (g_worker) {
+            CloseHandle(g_worker);
+            g_worker = nullptr;
+        }
         g_busy.store(0, std::memory_order_release);
         RefreshButtons();
         if (note) {
@@ -1798,28 +1937,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_CLOSE: {
+        bool cancel = false;
         if (g_busy.load()) {
             const int choice = DarkMessageBox(
                 hwnd,
-                L"An update is still running.\n\n"
-                L"Yes - cancel winget and close now. A partially installed\n"
+                L"A WinGet operation is still running.\n\n"
+                L"Yes - cancel the current command and close. A partially installed\n"
                 L"package may need reinstallation.\n"
-                L"No - close and let winget finish in the background.\n"
+                L"No - close and let the current command finish in the background.\n"
+                L"Closing discards any remaining selected-package commands.\n"
                 L"Cancel - keep the window open.",
                 kTitle, MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON3);
-            if (choice == IDCANCEL) return 0;
-            if (choice == IDYES && g_job) TerminateJobObject(g_job, 1);
+            if (choice != IDYES && choice != IDNO) return 0;
+            cancel = choice == IDYES && g_busy.load();
+        }
+        if (!StopLaunching(cancel)) {
+            DarkMessageBox(hwnd, L"Could not cancel the WinGet operation.", kTitle, MB_OK | MB_ICONERROR);
+            return 0;
         }
         DestroyWindow(hwnd);
         return 0;
     }
 
     case WM_DESTROY:
-        g_alive.store(0, std::memory_order_release);
-        if (g_job) {
-            CloseHandle(g_job);  // no kill-on-close: winget may keep running
-            g_job = nullptr;
-        }
+        StopLaunching(false);
         DeleteFonts();
         PostQuitMessage(0);
         return 0;
@@ -1831,7 +1972,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 }
 
 void LogStartupBanner() {
-    PostLog(L"Winget Update Manager 1.0.2");
+    PostLog(L"Winget Update Manager 1.0.3");
     PostLog(theme::IsDark() ? L"Theme: dark." : L"Theme: light.");
     if (g_elevated) {
         PostLog(L"Running with administrator rights.");
@@ -1911,6 +2052,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCmd) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+    StopLaunching(false);
+    if (g_worker) {
+        WaitForSingleObject(g_worker, INFINITE);
+        CloseHandle(g_worker);
     }
     return static_cast<int>(msg.wParam);
 }

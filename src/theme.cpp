@@ -115,12 +115,11 @@ void Init(bool dark) {
     g_dark = dark;
 
     // The user's accent colour, as the DWM reports it for glass composition.
-    // The value is in 0x00BBGGRR layout, i.e. a plain COLORREF.
+    // DWM returns 0xAARRGGBB. RGB constructs the Win32 COLORREF layout.
     DWORD color = 0;
     BOOL opaque = FALSE;
     if (SUCCEEDED(DwmGetColorizationColor(&color, &opaque))) {
-        const COLORREF fromSystem = static_cast<COLORREF>(color & 0x00FFFFFF);
-        if (fromSystem != 0) g_accent = fromSystem;
+        g_accent = RGB((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
     } else {
         g_accent = kFallbackAccent;
     }

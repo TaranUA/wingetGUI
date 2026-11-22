@@ -12,15 +12,17 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   W64DEVKIT_VERSION: 2.11.0
 
 jobs:
   build:
-    name: Build and release
+    name: Build and test
     runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
 
     steps:
       - name: Check out
@@ -29,8 +31,14 @@ jobs:
       - name: Resolve tag
         id: meta
         shell: pwsh
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_TAG: ${{ github.ref_name }}
         run: |
-          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          $tag = if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') { $env:INPUT_TAG } else { $env:REF_TAG }
+          if ($tag -and $tag -cnotmatch '\Av[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z') {
+            throw 'Expected a release tag such as v1.0.0 or v1.0.0-rc.1.'
+          }
           "tag=$tag" >> $env:GITHUB_OUTPUT
           Write-Host "Release tag: '$tag'"
 
@@ -63,7 +71,7 @@ jobs:
           path: tools\w64devkit
           key: w64devkit-${{ runner.os }}-${{ env.W64DEVKIT_VERSION }}
 
-      - name: Run parser tests
+      - name: Run regression tests
         shell: pwsh
         run: ./tests/run_tests.ps1
 
@@ -78,12 +86,25 @@ jobs:
           path: dist\WingetGUI.exe
           if-no-files-found: error
 
+  publish:
+    name: Publish release
+    needs: build
+    if: needs.build.outputs.tag != ''
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: WingetGUI
+          path: dist
+
       - name: Publish release
-        if: steps.meta.outputs.tag != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ steps.meta.outputs.tag }}
+          TAG: ${{ needs.build.outputs.tag }}
         run: |
           $exe = 'dist\WingetGUI.exe'
           Write-Host ("Asset: {0:N0} bytes" -f (Get-Item $exe).Length)

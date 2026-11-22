@@ -28,14 +28,10 @@ foreach ($tool in @('g++.exe', 'windres.exe')) {
 
 New-Item -ItemType Directory -Force -Path $obj, $dist | Out-Null
 
-# Terminate any running instance so Windows does not lock dist\WingetGUI.exe during link
-Get-Process -Name 'WingetGUI' -ErrorAction SilentlyContinue | Stop-Process -Force
-
-Write-Host 'Compiling resources...'
-& (Join-Path $bin 'windres.exe') -I $src (Join-Path $src 'app.rc') -O coff -o (Join-Path $obj 'app.res.o')
-if ($LASTEXITCODE -ne 0) { throw 'windres failed' }
-
-Write-Host 'Compiling and linking...'
+$exe = Join-Path $dist 'WingetGUI.exe'
+$buildId = [Guid]::NewGuid().ToString('N')
+$staged = Join-Path $dist "WingetGUI-$buildId.exe"
+$resource = Join-Path $obj "app-$buildId.res.o"
 $sources = @('main.cpp', 'parser.cpp', 'settings.cpp', 'theme.cpp', 'strings.cpp') |
     ForEach-Object { Join-Path $src $_ }
 
@@ -55,17 +51,35 @@ $compilerArgs = @(
     '-ffunction-sections', '-fdata-sections',
     '-fno-exceptions', '-fno-rtti', '-fno-threadsafe-statics',
     '-fno-asynchronous-unwind-tables', '-fno-unwind-tables', '-fno-ident',
-    '-o', (Join-Path $dist 'WingetGUI.exe')
+    '-o', $staged
 ) + $sources + @(
-    (Join-Path $obj 'app.res.o'),
+    $resource,
     '-lcomctl32', '-lshell32', '-luser32', '-lgdi32', '-ladvapi32',
     '-ldwmapi', '-luxtheme',
     '-static', '-static-libgcc', '-static-libstdc++',
     '-Wl,--gc-sections',
     '-Wl,--subsystem,windows', '-Wl,--nxcompat', '-Wl,--dynamicbase', '-Wl,--high-entropy-va'
 )
-& (Join-Path $bin 'g++.exe') @compilerArgs
-if ($LASTEXITCODE -ne 0) { throw 'compile failed' }
+try {
+    Write-Host 'Compiling resources...'
+    & (Join-Path $bin 'windres.exe') -I $src (Join-Path $src 'app.rc') -O coff -o $resource
+    if ($LASTEXITCODE -ne 0) { throw 'windres failed' }
 
-$exe = Join-Path $dist 'WingetGUI.exe'
+    Write-Host 'Compiling and linking...'
+    & (Join-Path $bin 'g++.exe') @compilerArgs
+    if ($LASTEXITCODE -ne 0) { throw 'compile failed' }
+
+    try {
+        if (Test-Path -LiteralPath $exe) {
+            [IO.File]::Replace($staged, $exe, [NullString]::Value)
+        } else {
+            [IO.File]::Move($staged, $exe)
+        }
+    } catch {
+        throw "Could not replace $exe. Close that build if it is running and retry. $($_.Exception.Message)"
+    }
+} finally {
+    Remove-Item -LiteralPath $staged, $resource -ErrorAction SilentlyContinue
+}
+
 Write-Host ("Built {0}  ({1:N0} bytes)" -f $exe, (Get-Item $exe).Length)

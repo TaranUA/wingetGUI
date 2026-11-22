@@ -206,13 +206,31 @@ void TestHeaderWordsInData() {
 }
 
 void TestDuplicates() {
-    std::printf("duplicate ids are collapsed\n");
+    std::printf("duplicate ids are collapsed within each source\n");
     std::string text = MakeTable({
         {"Alpha", "Vendor.Alpha", "1.0.0", "2.0.0", "winget"},
         {"Alpha again", "Vendor.Alpha", "1.0.0", "2.0.0", "winget"},
+        {"Store Alpha", "Vendor.Alpha", "1.0.0", "2.0.0", "msstore"},
     });
     const auto pkgs = ParseUpgradeOutput(text);
-    CheckSize(pkgs.size(), 1, "row count");
+    CheckSize(pkgs.size(), 2, "row count");
+    if (pkgs.size() == 2) CheckW(pkgs[1].source, L"msstore", "second source retained");
+}
+
+void TestDisplayColumns() {
+    std::printf("double-width package names preserve table columns\n");
+    std::string text = MakeTable({{"ABCD App", "Vendor.Cjk", "1.0", "2.0", "winget"}});
+    text.replace(text.find("ABCD"), 4, u8"\u6587\u5B57");
+    const auto pkgs = ParseUpgradeOutput(text);
+    CheckSize(pkgs.size(), 1, "wide row count");
+    if (pkgs.size() == 1) {
+        CheckW(pkgs[0].name, L"\u6587\u5B57 App", "wide name");
+        CheckW(pkgs[0].id, L"Vendor.Cjk", "id after wide name");
+        CheckW(pkgs[0].source, L"winget", "source after wide name");
+    }
+    Check(winget::ReportsNoUpdates("progress\nNo installed package has an update available.\n"),
+          "known no-update message");
+    Check(!winget::ReportsNoUpdates("Unexpected output.\n"), "unrecognized output is not an empty result");
 }
 
 void TestAnsiStripping() {
@@ -264,6 +282,7 @@ int main() {
     TestBannerBeforeTable();
     TestHeaderWordsInData();
     TestDuplicates();
+    TestDisplayColumns();
     TestAnsiStripping();
     TestEscapeArg();
 

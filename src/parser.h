@@ -25,5 +25,6 @@ std::wstring EscapeArg(const std::wstring& s);
 
 // Parses the fixed-width table printed by `winget upgrade`.
 std::vector<Package> ParseUpgradeOutput(const std::string& text);
+bool ReportsNoUpdates(const std::string& text);
 
 }  // namespace winget
